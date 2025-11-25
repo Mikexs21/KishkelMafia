@@ -1,14 +1,10 @@
-"""
-Main entry point for Telegram Mafia Bot.
-Initializes application, database, and registers all handlers.
-"""
-
 import asyncio
 import logging
 import random
 import os
 import signal
 import sys
+from datetime import datetime  # ← ДОДАНО для log функцій
 from engine import safe_send_message, safe_send_animation
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -39,7 +35,7 @@ from engine import (
     check_all_nominations_done,
     handle_potato_throw_callback,
     handle_petrushka_callback,
-    handle_lynch_decision_complete  # <-- ЦЕЙ РЯДОК ДОДАНИЙ
+    handle_lynch_decision_complete
 )
 
 
@@ -56,10 +52,54 @@ logger.setLevel(logging.INFO)
 
 
 # ====================================================
-# COMMAND HANDLERS
+# ЛОГУВАННЯ (ВИПРАВЛЕНО)
 # ====================================================
 
+def log_game_event(game_id: int, round_num: int, event_type: str, message: str):
+    """Log game event with enhanced formatting."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    emoji_map = {
+        "NIGHT": "🌙",
+        "DAY": "☀️",
+        "VOTING": "🗳",
+        "ENDED": "🏁",
+        "START": "🎮",
+        "KILL": "☠️",
+        "HEAL": "💚",
+        "CHECK": "🔍",
+        "SHOOT": "🔫",
+        "LYNCH": "⚰️",
+        "WIN": "🏆"
+    }
+    emoji = emoji_map.get(event_type, "📌")
+    logger.info(f"{emoji} Гра #{game_id} | Раунд {round_num} | {event_type} | {message}")
 
+
+def log_player_action(game_id: int, round_num: int, player_name: str, 
+                      role: str, action: str, target: str = ""):
+    """Log player action with role emoji."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    role_emoji = {
+        "don": "☠️",
+        "mafia": "🔪",
+        "doctor": "💉",
+        "detective": "🔍",
+        "deputy": "🔎",
+        "consigliere": "🎭",
+        "petrushka": "🎪",
+        "civilian": "👨‍🌾",
+        "mayor": "🎩",
+        "executioner": "⚔️",
+        "bot": "🤖"
+    }
+    emoji = role_emoji.get(role.lower(), "👤")
+    target_str = f" → {target}" if target else ""
+    logger.info(f"{emoji} {player_name} ({role}) {action}{target_str}")
+
+
+# ====================================================
+# COMMAND HANDLERS
+# ====================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command in DM and group."""
@@ -156,7 +196,7 @@ async def handle_mafia_chat_message(update: Update, context: ContextTypes.DEFAUL
     if player.role not in mafia_roles:
         return
     
-    # 🔧 ВИПРАВЛЕНО: Перевірка чи гравець живий
+    # Перевірка чи гравець живий
     if not player.is_alive:
         try:
             await context.bot.delete_message(
@@ -164,29 +204,36 @@ async def handle_mafia_chat_message(update: Update, context: ContextTypes.DEFAUL
                 update.message.message_id
             )
         except Exception as e:
-            logger.debug(f"Could not delete dead player message: {e}")
+            logger.debug(f"Не вдалося видалити повідомлення мертвого: {e}")
         return
     
     # Check if already sent
     if player.player_id in game.mafia_message_sent:
-        await update.message.reply_text("❌ Ти вже відправив повідомлення цієї ночі!")
+        await update.message.reply_text(
+            "❌ Ти вже відправив повідомлення команді цієї ночі!\n\n"
+            "Можна відправити тільки ОДНЕ повідомлення за ніч."
+        )
         return
     
     # Check length
     if len(message_text) > 200:
-        await update.message.reply_text("❌ Повідомлення занадто довге! Максимум 200 символів.")
+        await update.message.reply_text(
+            f"❌ Повідомлення занадто довге! Максимум 200 символів.\n\n"
+            f"Зараз: {len(message_text)} символів"
+        )
         return
     
     # Save message
     game.mafia_messages.append((player.username, message_text))
     game.mafia_message_sent.add(player.player_id)
     
-    await update.message.reply_text("✅ Повідомлення надіслано команді!")
+    await update.message.reply_text(
+        "✅ <b>Повідомлення надіслано команді!</b>\n\n"
+        f"Твоє повідомлення: \"{message_text[:50]}{'...' if len(message_text) > 50 else ''}\"",
+        parse_mode='HTML'
+    )
     
-    logger.info(visual.format_action_log(
-        game.game_id, game.round_num, player.username, 
-        "MAFIA_CHAT", f"Sent: {message_text[:50]}..."
-    ))
+    logger.info(f"💬 Мафія-чат від {player.username}: {message_text[:50]}...")
     
     # Send to all mafia members
     for p in game.players.values():
@@ -198,58 +245,16 @@ async def handle_mafia_chat_message(update: Update, context: ContextTypes.DEFAUL
                         f"💬 <b>{player.username}:</b>\n{message_text}",
                         parse_mode='HTML'
                     )
+                    logger.info(f"💬 Мафія-чат доставлено до {p.username}")
                 except Exception as e:
-                    logger.error(f"Failed to send mafia message to {p.username}: {e}")
+                    logger.error(f"Помилка надсилання мафія-чату до {p.username}: {e}")
+
 
 async def handle_last_words_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle last words from dying players."""
+    """Handle last words from dying players - ВИПРАВЛЕНА ВЕРСІЯ."""
     if update.effective_chat.type != 'private':
         return
     
-    if not update.message or not update.message.text:
-        return
-    
-    user_id = update.effective_user.id
-    message_text = update.message.text
-    
-    # Find game and player
-    game = None
-    player = None
-    
-    for g in game_manager.games.values():
-        for p in g.players.values():
-            if p.telegram_id == user_id and p.player_id in g.awaiting_last_words:
-                game = g
-                player = p
-                break
-        if game:
-            break
-    
-    if not game or not player:
-        return
-    
-    # Check length
-    if len(message_text) > 200:
-        await update.message.reply_text("❌ Занадто довго! Максимум 200 символів.")
-        return
-    
-    # Save last words
-    game.last_words[player.player_id] = message_text
-    game.awaiting_last_words.remove(player.player_id)
-    
-    await update.message.reply_text(
-        "✅ Твої останні слова записані. Всі їх побачать вранці.",
-        parse_mode='HTML'
-    )
-    
-    logger.info(f"Last words from {player.username}: {message_text[:50]}...")
-
-async def handle_last_words_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle last words from dying players."""
-    if update.effective_chat.type != 'private':
-        return
-    
-    # 🔧 ВИПРАВЛЕНО: Перевірка на всі типи контенту
     if not update.message:
         return
     
@@ -274,11 +279,24 @@ async def handle_last_words_message(update: Update, context: ContextTypes.DEFAUL
             break
     
     if not game or not player:
+        # Не знайдено гравця який очікує на останні слова
+        return
+    
+    # 🔧 ВИПРАВЛЕНО: Перевірка чи не надіслав вже
+    if player.player_id in game.last_words:
+        await update.message.reply_text(
+            "ℹ️ Ти вже надіслав свої останні слова!",
+            parse_mode='HTML'
+        )
         return
     
     # Check length
     if len(message_text) > 200:
-        await update.message.reply_text("❌ Занадто довго! Максимум 200 символів.")
+        await update.message.reply_text(
+            "❌ Занадто довго! Максимум 200 символів.\n\n"
+            f"Зараз: {len(message_text)} символів",
+            parse_mode='HTML'
+        )
         return
     
     # Save last words
@@ -286,11 +304,75 @@ async def handle_last_words_message(update: Update, context: ContextTypes.DEFAUL
     game.awaiting_last_words.remove(player.player_id)
     
     await update.message.reply_text(
-        "✅ Твої останні слова записані. Всі їх побачать вранці.",
+        "✅ <b>Твої останні слова записані!</b>\n\n"
+        "Всі гравці побачать їх вранці.\n\n"
+        f"<i>Твоє повідомлення: \"{message_text[:50]}{'...' if len(message_text) > 50 else ''}\"</i>",
         parse_mode='HTML'
     )
     
-    logger.info(f"Last words from {player.username}: {message_text[:50]}...")
+    logger.info(f"💬 Останні слова від {player.username}: {message_text[:50]}...")
+
+async def handle_last_words_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle last words from dying players - ВИПРАВЛЕНА ВЕРСІЯ."""
+    if update.effective_chat.type != 'private':
+        return
+    
+    if not update.message:
+        return
+    
+    # Дозволяємо ТІЛЬКИ текст
+    if not update.message.text:
+        return
+    
+    user_id = update.effective_user.id
+    message_text = update.message.text
+    
+    # Find game and player
+    game = None
+    player = None
+    
+    for g in game_manager.games.values():
+        for p in g.players.values():
+            if p.telegram_id == user_id and p.player_id in g.awaiting_last_words:
+                game = g
+                player = p
+                break
+        if game:
+            break
+    
+    if not game or not player:
+        # Не знайдено гравця який очікує на останні слова
+        return
+    
+    # Перевірка чи не надіслав вже
+    if player.player_id in game.last_words:
+        await update.message.reply_text(
+            "ℹ️ Ти вже надіслав свої останні слова!",
+            parse_mode='HTML'
+        )
+        return
+    
+    # Check length
+    if len(message_text) > 200:
+        await update.message.reply_text(
+            "❌ Занадто довго! Максимум 200 символів.\n\n"
+            f"Зараз: {len(message_text)} символів",
+            parse_mode='HTML'
+        )
+        return
+    
+    # Save last words
+    game.last_words[player.player_id] = message_text
+    game.awaiting_last_words.remove(player.player_id)
+    
+    await update.message.reply_text(
+        "✅ <b>Твої останні слова записані!</b>\n\n"
+        "Всі гравці побачать їх вранці.\n\n"
+        f"<i>Твоє повідомлення: \"{message_text[:50]}{'...' if len(message_text) > 50 else ''}\"</i>",
+        parse_mode='HTML'
+    )
+    
+    logger.info(f"💬 Останні слова від {player.username}: {message_text[:50]}...")
 
 
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -634,7 +716,7 @@ async def update_lobby_message(message, game) -> None:
 
 
 async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle night action callbacks."""
+    """Handle night action callbacks with enhanced protection."""
     query = update.callback_query
     
     user_id = query.from_user.id
@@ -678,7 +760,8 @@ async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data not in ["detective_check", "detective_shoot"]:
         if player.has_acted_this_night:
             try:
-                await query.answer("❌ Ти вже зробив вибір", show_alert=True)
+                await query.answer("❌ Ти вже зробив вибір цієї ночі", show_alert=True)
+                logger.warning(f"⚠️ {player.username} спробував діяти двічі (заблоковано)")
             except:
                 pass
             return
@@ -689,45 +772,56 @@ async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         error_msg = str(e).lower()
         if "too old" not in error_msg and "expired" not in error_msg:
-            logger.warning(f"Query answer failed (non-critical): {e}")
+            logger.warning(f"Query answer помилка (некритично): {e}")
     
     # Handle action
     if data.startswith("don_kill_"):
         target_id = data.replace("don_kill_", "")
+        logger.info(f"☠️ {player.username} обирає жертву: {game.players[target_id].username}")
         await handle_don_kill_callback(game, player, target_id, context)
     
     elif data.startswith("doc_heal_"):
         target_id = data.replace("doc_heal_", "")
+        logger.info(f"💉 {player.username} лікує: {game.players[target_id].username}")
         await handle_doctor_heal_callback(game, player, target_id, context)
     
     elif data == "detective_check":
+        logger.info(f"🔍 {player.username} обрав перевірку")
         targets = [(p.username, pid) for pid, p in game.players.items() 
                    if p.is_alive and pid != player.player_id]
         await query.message.reply_text(
-            "Обери кого перевірити:",
+            "🔍 <b>Обери кого перевірити:</b>",
             reply_markup=visual.get_detective_target_keyboard(targets, "check"),
             parse_mode='HTML'
         )
     
     elif data == "detective_shoot":
-        # 🔧 ВИПРАВЛЕНО: Строга перевірка has_used_gun
+        # 🔧 ВИПРАВЛЕНО: СТРОГА перевірка has_used_gun
         if player.has_used_gun:
             try:
-                await query.answer("❌ Ти вже використав пістолет раніше!", show_alert=True)
+                await query.answer(
+                    "❌ Ти вже використав пістолет раніше!\n\n"
+                    "Можеш тільки перевіряти ролі.",
+                    show_alert=True
+                )
+                logger.warning(f"⚠️ {player.username} спробував стріляти ЗНОВУ (заблоковано в callback)")
             except:
                 pass
             return
         
+        logger.info(f"🔫 {player.username} обрав постріл")
         targets = [(p.username, pid) for pid, p in game.players.items() 
                    if p.is_alive and pid != player.player_id]
         await query.message.reply_text(
-            "Обери в кого стріляти:",
+            "🔫 <b>Обери в кого стріляти:</b>\n\n"
+            "<i>⚠️ Пістолет можна використати тільки РАЗ за гру!</i>",
             reply_markup=visual.get_detective_target_keyboard(targets, "shoot"),
             parse_mode='HTML'
         )
     
     elif data.startswith("det_check_"):
         target_id = data.replace("det_check_", "")
+        logger.info(f"🔍 {player.username} перевіряє: {game.players[target_id].username}")
         await handle_detective_check_callback(game, player, target_id, context)
     
     elif data.startswith("det_shoot_"):
@@ -735,30 +829,38 @@ async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         if player.has_used_gun:
             try:
                 await query.answer("❌ Ти вже використав пістолет!", show_alert=True)
+                logger.warning(f"⚠️ {player.username} спробував стріляти ЗНОВУ (заблоковано в det_shoot_)")
             except:
                 pass
             return
+        
         target_id = data.replace("det_shoot_", "")
+        logger.info(f"🔫 {player.username} СТРІЛЯЄ у: {game.players[target_id].username}")
         await handle_detective_shoot_callback(game, player, target_id, context)
     
     elif data.startswith("potato_"):
         if data == "potato_skip":
             player.has_thrown_potato = True
             player.has_acted_this_night = True
+            logger.info(f"🥔 {player.username} пропустив картоплю")
             await query.message.reply_text(visual.ACTION_CONFIRMED["potato_skip"])
+            await check_all_night_actions_done(game, context)
         else:
             target_id = data.replace("potato_", "")
+            logger.info(f"🥔 {player.username} кидає картоплю в: {game.players[target_id].username}")
             await handle_potato_throw_callback(game, player, target_id, context)
     
     elif data.startswith("petrushka_"):
         if data == "petrushka_skip":
             player.has_used_petrushka = True
             player.has_acted_this_night = True
+            logger.info(f"🎪 {player.username} пропустив Петрушку")
             await query.message.reply_text(visual.ACTION_CONFIRMED["petrushka_skip"])
+            await check_all_night_actions_done(game, context)
         else:
             target_id = data.replace("petrushka_", "")
+            logger.info(f"🎪 {player.username} використовує Петрушку на: {game.players[target_id].username}")
             await handle_petrushka_callback(game, player, target_id, context)
-
 
 
 async def voting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
