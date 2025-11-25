@@ -18,6 +18,17 @@ from telegram.ext import (
     filters
 )
 
+from button_protection import (
+    button_protection,
+    prevent_duplicates,
+    lobby_callback,
+    night_action_callback,
+    voting_callback,
+    nomination_callback,
+    confirmation_callback,
+    shop_callback
+)
+
 import config
 import db
 import visual
@@ -49,6 +60,8 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
 
 class ColoredFormatter(logging.Formatter):
     """Colored log formatter for better readability."""
@@ -907,6 +920,41 @@ async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             target_id = data.replace("petrushka_", "")
             logger.info(f"🎪 {player.username} використовує Петрушку на: {game.players[target_id].username}")
             await handle_petrushka_callback(game, player, target_id, context)
+    elif data.startswith("det_shoot_"):
+    # 🔒 ПЕРЕВІРКА 1: Чи не використав вже
+    if player.has_used_gun:
+        try:
+            await query.answer("❌ Ти вже використав пістолет!", show_alert=True)
+            logger.warning(f"⚠️ {player.username} спробував стріляти ЗНОВУ")
+        except:
+            pass
+        return
+    
+    target_id = data.replace("det_shoot_", "")
+    
+    # 🔒 ПЕРЕВІРКА 2: Чи не стріляє в себе
+    if target_id == player.player_id:
+        try:
+            await query.answer(
+                "❌ Не можна стріляти в себе!\n\n"
+                "Це самогубство, а не розслідування! 🔫🚫", 
+                show_alert=True
+            )
+            logger.warning(f"⚠️ {player.username} спробував ВИСТРІЛИТИ В СЕБЕ (заблоковано)")
+        except:
+            pass
+        return
+    
+    # 🔒 ПЕРЕВІРКА 3: Ціль існує і жива
+    if target_id not in game.players or not game.players[target_id].is_alive:
+        try:
+            await query.answer("❌ Неправильна ціль!", show_alert=True)
+        except:
+            pass
+        return
+    
+    logger.info(f"🔫 {player.username} СТРІЛЯЄ у: {game.players[target_id].username}")
+    await handle_detective_shoot_callback(game, player, target_id, context)
 
 
 async def voting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

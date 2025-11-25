@@ -1046,49 +1046,68 @@ def is_mafia_acting_don(game: GameState) -> bool:
 
 
 async def check_all_night_actions_done(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Check if all players have acted and resolve night early if so."""
+    """
+    Check if all players have acted and resolve night early.
+    
+    ✅ ЗАХИСТ:
+    - Lock
+    - Processing flag
+    - Phase check
+    """
+    
     if game.phase != Phase.NIGHT:
         return
     
     if not hasattr(game, '_night_resolution_lock'):
         game._night_resolution_lock = asyncio.Lock()
     
+    # Не блокувати якщо вже обробляється
+    if game._night_resolution_lock.locked():
+        logger.debug("Night resolution busy, пропускаємо")
+        return
+    
     async with game._night_resolution_lock:
+        # Processing flag
         if hasattr(game, '_resolving_night') and game._resolving_night:
-            logger.debug("Already resolving night, skipping duplicate check")
+            logger.debug("Night вже розв'язується, пропускаємо")
             return
         
+        # Перевірити чи всі зробили дії
         for player in game.players.values():
             if not player.is_alive:
                 continue
             
+            # Skip civilians (unless bukovel potato)
             if player.role == "civilian":
                 if game.is_bukovel and game.round_num == 1 and not player.has_thrown_potato:
                     if not player.has_acted_this_night:
                         return
                 continue
             
+            # Skip used petrushka
             if player.role == "petrushka" and player.has_used_petrushka:
                 continue
             
+            # Active roles must act
             if player.role in ["don", "doctor", "detective", "deputy", "consigliere"]:
                 if not player.has_acted_this_night:
                     return
             
+            # Mafia acts if don dead
             if player.role == "mafia" and is_mafia_acting_don(game):
                 if not player.has_acted_this_night:
                     return
         
-        # All done
-        logger.info(visual.format_game_log(game.game_id, game.round_num, "NIGHT", "All actions done, resolving early"))
+        # All done!
+        logger.info("✅ Всі дії завершені, розв'язуємо ніч достроково")
         game._resolving_night = True
         
-        # ✅ ВИПРАВЛЕНО: Правильне скасування таймера
+        # Cancel timer
         if game.timer_task and not game.timer_task.done():
             game.timer_task.cancel()
             try:
                 await game.timer_task
-                logger.info("Timer cancelled successfully due to early night resolution")
+                logger.info("Timer скасовано (early resolution)")
             except asyncio.CancelledError:
                 pass
         
@@ -1154,23 +1173,33 @@ async def broadcast_last_words(game: GameState, context: ContextTypes.DEFAULT_TY
 """
 
 async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Resolve all night actions with flood control."""
-    logger.info(visual.format_game_log(game.game_id, game.round_num, "NIGHT", "🌙 Розв'язуємо нічні дії"))
+    """
+    Resolve all night actions.
     
-    deaths = []
+    ✅ НОВА ЛОГІКА:
+    1. Збираємо потенційні смерті
+    2. Застосовуємо лікаря
+    3. Повідомляємо жертв (врятовані/помираючі)
+    4. Чекаємо останні слова ТІЛЬКИ від помираючих
+    5. Показуємо результати
+    """
+    
+    logger.info(visual.format_game_log(game.game_id, game.round_num, "NIGHT", "🌙 Розв'язуємо ніч"))
+    
     events = []
-    saved_player_id = None
     
-    # Collect kills
+    # ========================================
+    # КРОК 1: Збираємо потенційні смерті
+    # ========================================
     potential_deaths = set()
     
     if game.don_target:
         potential_deaths.add(game.don_target)
-        logger.info(f"🔪 Дон обрав ціль: {game.players[game.don_target].username}")
+        logger.info(f"🔪 Дон → {game.players[game.don_target].username}")
     
     if game.detective_shoot_target:
         potential_deaths.add(game.detective_shoot_target)
-        logger.info(f"🔫 Детектив вистрілив у: {game.players[game.detective_shoot_target].username}")
+        logger.info(f"🔫 Детектив → {game.players[game.detective_shoot_target].username}")
     
     # Potato kills
     for thrower_id, target_id in game.potato_actions:
@@ -1178,7 +1207,7 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
             potential_deaths.add(target_id)
             thrower = game.players[thrower_id]
             target = game.players[target_id]
-            logger.info(f"🥔💥 {thrower.username} влучив картоплею в {target.username}!")
+            logger.info(f"🥔💥 {thrower.username} → {target.username}")
             await safe_send_message(
                 context,
                 game.group_chat_id,
@@ -1188,7 +1217,7 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
             await asyncio.sleep(0.5)
         else:
             target = game.players[target_id]
-            logger.info(f"🥔 Картопля {target.username} промахнулась")
+            logger.info(f"🥔 Промах → {target.username}")
             await safe_send_message(
                 context,
                 game.group_chat_id,
@@ -1197,48 +1226,113 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             await asyncio.sleep(0.5)
     
-    # Doctor save
+    # ========================================
+    # КРОК 2: Застосовуємо лікаря
+    # ========================================
+    saved_player_id = None
+    
     if game.doctor_target and game.doctor_target in potential_deaths:
         potential_deaths.remove(game.doctor_target)
         saved_player_id = game.doctor_target
         logger.info(f"💚 Лікар врятував: {game.players[saved_player_id].username}")
         
+        # Award heal
         for p in game.players.values():
             if p.role == "doctor" and p.is_alive:
                 p.heals += 1
                 if not p.is_bot:
-                    await db.update_user_stats(await db.get_or_create_user(p.telegram_id, p.username), saves=1)
+                    await db.update_user_stats(
+                        await db.get_or_create_user(p.telegram_id, p.username),
+                        saves=1
+                    )
     
-    # Apply deaths
-    for pid in potential_deaths:
+    # ========================================
+    # КРОК 3: Повідомляємо жертв про замахи
+    # ========================================
+    attempted_targets = []
+    if game.don_target:
+        attempted_targets.append(game.don_target)
+    if game.detective_shoot_target:
+        attempted_targets.append(game.detective_shoot_target)
+    
+    for target_id in set(attempted_targets):
+        target = game.players[target_id]
+        
+        if target.is_bot or not target.telegram_id:
+            continue
+        
+        was_saved = target_id == saved_player_id
+        will_die = target_id in potential_deaths
+        
+        try:
+            if was_saved:
+                # 🎉 ВРЯТУВАЛИ
+                await context.bot.send_message(
+                    target.telegram_id,
+                    "🚑 <b>ТЕБЕ ВРЯТУВАЛИ!</b>\n\n"
+                    "На тебе скоїли замах, але лікар прибіг вчасно!\n\n"
+                    "✨ <b>От і вдача!</b> Ти живий!",
+                    parse_mode='HTML'
+                )
+                logger.info(f"💚 {target.username} врятовано - повідомлено")
+            
+            elif will_die:
+                # 💀 ПОМРЕШ
+                await context.bot.send_message(
+                    target.telegram_id,
+                    f"⚠️ <b>НА ТЕБЕ СКОЇЛИ ЗАМАХ!</b>\n\n"
+                    f"Лікар не встиг... Це кінець.\n\n"
+                    f"У тебе <b>{config.LAST_WORDS_TIMEOUT}с</b> написати останні слова.\n\n"
+                    f"<i>Надішли текст (до 200 символів)</i>",
+                    parse_mode='HTML'
+                )
+                game.awaiting_last_words.add(target_id)
+                logger.info(f"💀 {target.username} помирає - запит останніх слів")
+        
+        except Exception as e:
+            logger.error(f"Помилка повідомлення {target.username}: {e}")
+    
+    # ========================================
+    # КРОК 4: Чекаємо останні слова
+    # ========================================
+    if game.awaiting_last_words and config.LAST_WORDS_ENABLED:
+        logger.info(f"⏳ Чекаємо {config.LAST_WORDS_TIMEOUT}с на останні слова")
+        await asyncio.sleep(config.LAST_WORDS_TIMEOUT)
+        logger.info(f"✅ Отримано {len(game.last_words)} останніх слів")
+    
+    # ========================================
+    # КРОК 5: Застосовуємо смерті
+    # ========================================
+    deaths = list(potential_deaths)
+    
+    for pid in deaths:
         player = game.players[pid]
         player.is_alive = False
-        deaths.append(pid)
-        logger.info(f"💀 {player.username} помер (роль: {visual.ROLE_NAMES.get(player.role, player.role)})")
+        logger.info(f"💀 {player.username} помер ({player.role})")
         
         if player.db_player_id:
             await db.update_game_player_stats(player.db_player_id, is_alive=0)
         
-        # Bot AI learns from death
+        # Bot AI learns
         for bot_pid in game.player_order:
             bot = game.players[bot_pid]
             if bot.is_bot and bot.is_alive:
                 await bot_ai.observe_death(bot.player_id, pid, player.role)
         
-        # Award kill points
+        # Award kills
         if game.don_target == pid:
             for p in game.players.values():
                 if p.role in ["don", "mafia"] and p.is_alive:
                     p.kills += 1
                     if not p.is_bot:
-                        await db.update_user_stats(await db.get_or_create_user(p.telegram_id, p.username), kills=1)
+                        await db.update_user_stats(
+                            await db.get_or_create_user(p.telegram_id, p.username),
+                            kills=1
+                        )
     
-    # 🔧 ВИПРАВЛЕНО: Запитуємо останні слова ТІЛЬКИ ОДИН РАЗ
-    if deaths and config.LAST_WORDS_ENABLED:
-        logger.info(f"💬 Запитуємо останні слова у {len(deaths)} гравців...")
-        await request_last_words(game, context, deaths)
-    
-    # Send check results (БЕЗ затримки щоб не блокувати)
+    # ========================================
+    # КРОК 6: Надіслати результати перевірок
+    # ========================================
     for checker_id, (target_id, target_role) in game.check_results.items():
         checker = game.players[checker_id]
         target = game.players[target_id]
@@ -1247,17 +1341,24 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
             try:
                 await context.bot.send_message(
                     checker.telegram_id,
-                    visual.CHECK_RESULT.format(name=target.username, role=visual.ROLE_NAMES[target_role]),
+                    visual.CHECK_RESULT.format(
+                        name=target.username,
+                        role=visual.ROLE_NAMES[target_role]
+                    ),
                     parse_mode='HTML'
                 )
-                logger.info(f"🔍 {checker.username} перевірив {target.username}: {target_role}")
+                logger.info(f"🔍 {checker.username} → {target.username}: {target_role}")
             except Exception as e:
-                logger.error(f"Помилка надсилання результату перевірки до {checker.username}: {e}")
+                logger.error(f"Помилка перевірки: {e}")
     
-    # Send notifications
+    # ========================================
+    # КРОК 7: Надіслати повідомлення про дії
+    # ========================================
     await send_night_notifications(game, context, deaths, saved_player_id)
     
-    # Determine events
+    # ========================================
+    # КРОК 8: Визначити події
+    # ========================================
     if len(deaths) == 0:
         if saved_player_id:
             events.append("doc_saved")
@@ -1281,9 +1382,11 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         events.append("event_both_died")
     
-    # Перевіряємо прапорець
+    # ========================================
+    # КРОК 9: Перехід до дня
+    # ========================================
     if hasattr(game, '_day_started') and game._day_started:
-        logger.warning("⚠️ День вже почався, пропускаємо дублікат start_day")
+        logger.warning("⚠️ День вже почався")
         return
     
     game._day_started = True
@@ -1291,9 +1394,87 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
     
     await asyncio.sleep(2)
     
-    logger.info(f"☀️ Переходимо до дня з {len(events)} подіями")
     await start_day(game, context, events, deaths)
 
+async def send_night_notifications(game: GameState, context: ContextTypes.DEFAULT_TYPE,
+                                   deaths: List[str], saved_player_id: Optional[str]) -> None:
+    """Send notifications to players about night results."""
+    
+    # Notify mafia
+    if game.don_target:
+        target = game.players[game.don_target]
+        killed = game.don_target in deaths
+        
+        mafia_roles = {"don", "mafia", "consigliere"}
+        for p in game.players.values():
+            if p.role in mafia_roles and p.is_alive and not p.is_bot and p.telegram_id:
+                try:
+                    if killed:
+                        await context.bot.send_message(
+                            p.telegram_id,
+                            f"☠️ <b>Місія виконана!</b>\n\n"
+                            f"{target.username} більше не проблема.",
+                            parse_mode='HTML'
+                        )
+                    else:
+                        await context.bot.send_message(
+                            p.telegram_id,
+                            f"💔 <b>Невдача!</b>\n\n"
+                            f"{target.username} вижив...",
+                            parse_mode='HTML'
+                        )
+                except Exception as e:
+                    logger.error(f"Помилка мафія-нотіфікації: {e}")
+    
+    # Notify doctor
+    if game.doctor_target:
+        for p in game.players.values():
+            if p.role == "doctor" and p.is_alive and not p.is_bot and p.telegram_id:
+                target = game.players[game.doctor_target]
+                saved = game.doctor_target == saved_player_id
+                
+                try:
+                    if saved:
+                        await context.bot.send_message(
+                            p.telegram_id,
+                            f"💚 <b>Врятував!</b>\n\n"
+                            f"Ти врятував {target.username}!",
+                            parse_mode='HTML'
+                        )
+                    else:
+                        await context.bot.send_message(
+                            p.telegram_id,
+                            f"😔 <b>Нікого не атакували...</b>\n\n"
+                            f"{target.username} був у безпеці.",
+                            parse_mode='HTML'
+                        )
+                except Exception as e:
+                    logger.error(f"Помилка доктор-нотіфікації: {e}")
+    
+    # Notify detective about shoot
+    if game.detective_shoot_target:
+        for p in game.players.values():
+            if p.role == "detective" and p.is_alive and not p.is_bot and p.telegram_id:
+                target = game.players[game.detective_shoot_target]
+                killed = game.detective_shoot_target in deaths
+                
+                try:
+                    if killed:
+                        await context.bot.send_message(
+                            p.telegram_id,
+                            f"🔫 <b>Влучив!</b>\n\n"
+                            f"{target.username} більше не загроза.",
+                            parse_mode='HTML'
+                        )
+                    else:
+                        await context.bot.send_message(
+                            p.telegram_id,
+                            f"😬 <b>Промах...</b>\n\n"
+                            f"{target.username} вижив.",
+                            parse_mode='HTML'
+                        )
+                except Exception as e:
+                    logger.error(f"Помилка детектив-нотіфікації: {e}")
 
 async def start_day(game: GameState, context: ContextTypes.DEFAULT_TYPE,
                     events: List[str], deaths: List[str]) -> None:
@@ -1590,54 +1771,77 @@ async def execute_bot_lynch_vote(game: GameState, bot: PlayerState) -> None:
 
 
 async def handle_lynch_decision_complete(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle completed lynch decision voting with race protection."""
+    """
+    Handle completed lynch decision voting.
     
-    # 🔧 ДОДАНО: Захист від race conditions
-    if not hasattr(game, '_processing_lynch'):
-        game._processing_lynch = False
+    ✅ ЗАХИСТ:
+    - Async lock (тільки один виклик одночасно)
+    - Processing flag
+    - Timestamp check
+    """
     
-    if game._processing_lynch:
-        logger.warning("⚠️ Lynch decision вже обробляється, пропускаємо дублікат")
+    # Створити lock якщо немає
+    if not hasattr(game, '_lynch_lock'):
+        game._lynch_lock = asyncio.Lock()
+    
+    # Спробувати отримати lock (не блокуючи якщо вже зайнято)
+    if game._lynch_lock.locked():
+        logger.warning("⚠️ Lynch decision вже обробляється (lock busy), пропускаємо")
         return
     
-    game._processing_lynch = True
-    
-    try:
-        alive_count = sum(1 for p in game.players.values() if p.is_alive)
+    async with game._lynch_lock:
+        # Додаткова перевірка processing flag
+        if hasattr(game, '_processing_lynch') and game._processing_lynch:
+            logger.warning("⚠️ Lynch decision flag=True, пропускаємо")
+            return
         
-        yes_count = 0
-        no_count = 0
+        # Timestamp check
+        current_time = time.time()
+        if hasattr(game, '_last_lynch_time'):
+            time_diff = current_time - game._last_lynch_time
+            if time_diff < 1.0:
+                logger.warning(f"⚠️ Lynch decision занадто швидко ({time_diff:.2f}s), блокуємо")
+                return
         
-        for voter_id, vote in game.lynch_votes.items():
-            voter = game.players[voter_id]
-            weight = 2 if voter.role == "mayor" else 1
+        # Встановити прапорці
+        game._last_lynch_time = current_time
+        game._processing_lynch = True
+        
+        try:
+            alive_count = sum(1 for p in game.players.values() if p.is_alive)
             
-            if vote == "yes":
-                yes_count += weight
+            yes_count = 0
+            no_count = 0
+            
+            for voter_id, vote in game.lynch_votes.items():
+                voter = game.players[voter_id]
+                weight = 2 if voter.role == "mayor" else 1
+                
+                if vote == "yes":
+                    yes_count += weight
+                else:
+                    no_count += weight
+            
+            logger.info(f"📊 Lynch: ТАК={yes_count}, НІ={no_count}, ВСЬОГО={alive_count}")
+            
+            # Потрібна більшість
+            if yes_count > alive_count / 2:
+                logger.info(f"✅ Переходимо до номінацій")
+                await start_nominations(game, context)
             else:
-                no_count += weight
+                logger.info(f"❌ Недостатньо голосів")
+                await safe_send_message(
+                    context,
+                    game.group_chat_id,
+                    visual.NO_HANGING,
+                    parse_mode='HTML'
+                )
+                
+                game.round_num += 1
+                await start_night(game, context)
         
-        logger.info(f"📊 Lynch рішення: ТАК={yes_count}, НІ={no_count}, ВСЬОГО={alive_count}")
-        
-        # Потрібна більшість від ВСІХ живих
-        if yes_count > alive_count / 2:
-            logger.info(f"✅ Переходимо до номінацій ({yes_count} > {alive_count/2})")
-            await start_nominations(game, context)
-        else:
-            logger.info(f"❌ Недостатньо голосів ({yes_count} <= {alive_count/2})")
-            await safe_send_message(
-                context,
-                game.group_chat_id,
-                visual.NO_HANGING,
-                parse_mode='HTML'
-            )
-            
-            game.round_num += 1
-            await start_night(game, context)
-    
-    finally:
-        game._processing_lynch = False
-
+        finally:
+            game._processing_lynch = False
 
 # ====================================================
 # ВИПРАВЛЕННЯ №1: Таймер з правильним оновленням
@@ -1859,25 +2063,40 @@ async def execute_bot_nomination(game: GameState, bot: PlayerState, context: Con
 
 
 async def check_all_nominations_done(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Check if all alive players nominated with race protection."""
+    """
+    Check if all alive players nominated.
+    
+    ✅ ЗАХИСТ:
+    - Lock per game
+    - Processing flag
+    - Count verification
+    """
+    
     if game.phase != Phase.VOTING:
         return
     
     if not hasattr(game, '_nominations_lock'):
         game._nominations_lock = asyncio.Lock()
     
+    # Не блокувати якщо вже обробляється
+    if game._nominations_lock.locked():
+        logger.debug("Nominations lock busy, пропускаємо")
+        return
+    
     async with game._nominations_lock:
+        # Processing flag check
         if hasattr(game, '_nominations_processed') and game._nominations_processed:
-            logger.debug("⚠️ Номінації вже оброблені, пропускаємо дублікат")
+            logger.debug("Nominations вже оброблені, пропускаємо")
             return
         
         alive_count = sum(1 for p in game.players.values() if p.is_alive)
         
         if len(game.nomination_votes) >= alive_count:
-            logger.info(f"✅ Всі проголосували ({len(game.nomination_votes)}/{alive_count}), обробка рано")
+            logger.info(f"✅ Всі номінували ({len(game.nomination_votes)}/{alive_count})")
             
             game._nominations_processed = True
             
+            # Cancel timer if exists
             if hasattr(game, 'nomination_timer') and game.nomination_timer:
                 if not game.nomination_timer.done():
                     game.nomination_timer.cancel()
@@ -1887,6 +2106,7 @@ async def check_all_nominations_done(game: GameState, context: ContextTypes.DEFA
                         pass
             
             await process_nominations(game, context)
+
 
 
 async def nomination_timer(game: GameState, context: ContextTypes.DEFAULT_TYPE, duration: int) -> None:
@@ -1899,96 +2119,124 @@ async def nomination_timer(game: GameState, context: ContextTypes.DEFAULT_TYPE, 
 
 
 async def process_nominations(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process nominations and select candidate with race protection."""
+    """
+    Process nominations and select candidate.
     
-    # 🔧 ДОДАНО: Захист від дублікатів
-    if hasattr(game, '_processing_nominations_now') and game._processing_nominations_now:
-        logger.warning("⚠️ Номінації вже обробляються ЗАРАЗ, пропускаємо")
+    ✅ ЗАХИСТ:
+    - Lock
+    - Processing flag
+    - Timestamp
+    """
+    
+    if not hasattr(game, '_process_nominations_lock'):
+        game._process_nominations_lock = asyncio.Lock()
+    
+    if game._process_nominations_lock.locked():
+        logger.warning("⚠️ process_nominations вже виконується, пропускаємо")
         return
     
-    game._processing_nominations_now = True
-    
-    try:
-        if not game.nomination_votes:
+    async with game._process_nominations_lock:
+        # Processing flag
+        if hasattr(game, '_processing_nominations_now') and game._processing_nominations_now:
+            logger.warning("⚠️ Nominations flag=True, пропускаємо")
+            return
+        
+        # Timestamp check
+        current_time = time.time()
+        if hasattr(game, '_last_process_nominations_time'):
+            time_diff = current_time - game._last_process_nominations_time
+            if time_diff < 1.0:
+                logger.warning(f"⚠️ process_nominations занадто швидко ({time_diff:.2f}s)")
+                return
+        
+        game._last_process_nominations_time = current_time
+        game._processing_nominations_now = True
+        
+        try:
+            if not game.nomination_votes:
+                await safe_send_message(
+                    context,
+                    game.group_chat_id,
+                    visual.NO_CANDIDATE,
+                    parse_mode='HTML'
+                )
+                
+                # Скинути прапорці
+                if hasattr(game, '_nominations_processed'):
+                    game._nominations_processed = False
+                
+                game.round_num += 1
+                await start_night(game, context)
+                return
+            
+            # Count votes with mayor weight
+            vote_counts = {}
+            for voter_id, candidate_id in game.nomination_votes.items():
+                if game.players[candidate_id].is_alive:
+                    voter = game.players[voter_id]
+                    weight = 2 if voter.role == "mayor" else 1
+                    vote_counts[candidate_id] = vote_counts.get(candidate_id, 0) + weight
+            
+            if not vote_counts:
+                await safe_send_message(
+                    context,
+                    game.group_chat_id,
+                    visual.NO_CANDIDATE,
+                    parse_mode='HTML'
+                )
+                
+                if hasattr(game, '_nominations_processed'):
+                    game._nominations_processed = False
+                
+                game.round_num += 1
+                await start_night(game, context)
+                return
+            
+            # Find top candidate
+            alive_count = sum(1 for p in game.players.values() if p.is_alive)
+            threshold = math.ceil(alive_count * config.NOMINATION_THRESHOLD_RATIO)
+            
+            max_votes = max(vote_counts.values())
+            
+            logger.info(f"📊 Номінації: {vote_counts}, поріг={threshold}")
+            
+            if max_votes < threshold:
+                logger.info(f"❌ Недостатньо голосів ({max_votes} < {threshold})")
+                await safe_send_message(
+                    context,
+                    game.group_chat_id,
+                    visual.NO_CANDIDATE,
+                    parse_mode='HTML'
+                )
+                
+                if hasattr(game, '_nominations_processed'):
+                    game._nominations_processed = False
+                
+                game.round_num += 1
+                await start_night(game, context)
+                return
+            
+            # Select candidate
+            candidates_with_max = [cid for cid, count in vote_counts.items() if count == max_votes]
+            game.current_candidate = random.choice(candidates_with_max)
+            
+            candidate = game.players[game.current_candidate]
+            
+            logger.info(f"🎯 Кандидат: {candidate.username} ({max_votes} голосів)")
+            
             await safe_send_message(
                 context,
                 game.group_chat_id,
-                visual.NO_CANDIDATE,
+                visual.CANDIDATE_SELECTED.format(name=candidate.username),
                 parse_mode='HTML'
             )
-            if hasattr(game, '_nominations_processed'):
-                game._nominations_processed = False
+            
+            await asyncio.sleep(1)
+            
+            await start_confirmation(game, context)
+        
+        finally:
             game._processing_nominations_now = False
-            game.round_num += 1
-            await start_night(game, context)
-            return
-        
-        # Врахування ваги мера в номінаціях
-        vote_counts = {}
-        for voter_id, candidate_id in game.nomination_votes.items():
-            if game.players[candidate_id].is_alive:
-                voter = game.players[voter_id]
-                weight = 2 if voter.role == "mayor" else 1
-                vote_counts[candidate_id] = vote_counts.get(candidate_id, 0) + weight
-        
-        if not vote_counts:
-            await safe_send_message(
-                context,
-                game.group_chat_id,
-                visual.NO_CANDIDATE,
-                parse_mode='HTML'
-            )
-            if hasattr(game, '_nominations_processed'):
-                game._nominations_processed = False
-            game._processing_nominations_now = False
-            game.round_num += 1
-            await start_night(game, context)
-            return
-        
-        # Find top candidate
-        alive_count = sum(1 for p in game.players.values() if p.is_alive)
-        threshold = math.ceil(alive_count * config.NOMINATION_THRESHOLD_RATIO)
-        
-        max_votes = max(vote_counts.values())
-        
-        logger.info(f"📊 Голоси номінацій: {vote_counts}, поріг={threshold}")
-        
-        if max_votes < threshold:
-            logger.info(f"❌ Недостатньо голосів для номінації ({max_votes} < {threshold})")
-            await safe_send_message(
-                context,
-                game.group_chat_id,
-                visual.NO_CANDIDATE,
-                parse_mode='HTML'
-            )
-            if hasattr(game, '_nominations_processed'):
-                game._nominations_processed = False
-            game._processing_nominations_now = False
-            game.round_num += 1
-            await start_night(game, context)
-            return
-        
-        # Select candidate
-        candidates_with_max = [cid for cid, count in vote_counts.items() if count == max_votes]
-        game.current_candidate = random.choice(candidates_with_max) if len(candidates_with_max) > 1 else candidates_with_max[0]
-        
-        candidate = game.players[game.current_candidate]
-        
-        logger.info(f"🎯 Обрано кандидата: {candidate.username} ({max_votes} голосів)")
-        
-        await safe_send_message(
-            context,
-            game.group_chat_id,
-            visual.CANDIDATE_SELECTED.format(name=candidate.username),
-            parse_mode='HTML'
-        )
-        
-        await asyncio.sleep(1)
-        
-        await start_confirmation(game, context)
-    
-    finally:
-        game._processing_nominations_now = False
 
 
 async def start_confirmation(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> None:
