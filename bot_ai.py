@@ -5,10 +5,13 @@ Thread-safe implementation with configurable behavior.
 
 import random
 import asyncio
+import logging
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass, field
 from enum import Enum
 import config
+
+logger = logging.getLogger(__name__)
 
 
 class SuspicionLevel(Enum):
@@ -48,7 +51,7 @@ class BotAI:
     
     def __init__(self):
         self.memories: Dict[str, BotMemory] = {}
-        self._lock = asyncio.Lock()  # 🔧 Thread-safety для multiple games
+        self._lock = asyncio.Lock()
     
     async def get_or_create_memory(self, player_id: str, role: str) -> BotMemory:
         """Thread-safe get or create memory for a bot."""
@@ -423,28 +426,25 @@ class BotAI:
             memory.last_night_target = None
     
     async def cleanup_old_memories(self, max_age_hours: int = 24):
-    """
-    Clean up old bot memories to prevent memory leaks.
-    
-    ПОКРАЩЕНО: Додано timestamp-based cleanup
-    """
-    async with self._lock:
-        import sys
-        from datetime import datetime, timedelta
-        
-        # Перевірка розміру пам'яті
-        size = sys.getsizeof(self.memories)
-        
-        if size > 1024 * 1024:  # 1MB
-            logger.warning(f"⚠️ Bot AI memory size: {size / 1024:.2f} KB")
+        """
+        Clean up old bot memories to prevent memory leaks.
+        """
+        async with self._lock:
+            import sys
             
-            # Видалити найстаріші 50% якщо більше 100 записів
-            if len(self.memories) > 100:
-                keys = list(self.memories.keys())
-                to_remove = keys[:len(keys)//2]
-                for key in to_remove:
-                    del self.memories[key]
-                logger.info(f"🧹 Cleaned up {len(to_remove)} old bot memories")
+            # Check memory size
+            size = sys.getsizeof(self.memories)
+            
+            if size > 1024 * 1024:  # 1MB
+                logger.warning(f"⚠️ Bot AI memory size: {size / 1024:.2f} KB")
+                
+                # Remove oldest 50% if more than 100 entries
+                if len(self.memories) > 100:
+                    keys = list(self.memories.keys())
+                    to_remove = keys[:len(keys)//2]
+                    for key in to_remove:
+                        del self.memories[key]
+                    logger.info(f"🧹 Cleaned up {len(to_remove)} old bot memories")
 
 
 # Global AI instance

@@ -1599,8 +1599,14 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as e:
         logger.error(f"Failed to send error message to user: {e}")
 
+# Додайте це в кінець main.py, замініть існуючу функцію main()
+
 def main() -> None:
     """Start the bot with proper error handling."""
+    
+    print("="*60)
+    print("🎮 Mafia Bot Starting...")
+    print("="*60)
     
     # Перевірка токена
     if not hasattr(config, 'BOT_TOKEN') or not config.BOT_TOKEN:
@@ -1611,6 +1617,8 @@ def main() -> None:
     if config.BOT_TOKEN == "PASTE_TOKEN_HERE":
         print("❌ ERROR: Please replace BOT_TOKEN in config.py with your actual token")
         return
+    
+    print(f"✅ Bot token configured: {config.BOT_TOKEN[:20]}...")
     
     # Перевірка критичних констант
     if not hasattr(config, 'DATABASE_FILE'):
@@ -1623,9 +1631,14 @@ def main() -> None:
         print("Please add ROLE_DISTRIBUTION dictionary")
         return
     
+    print(f"✅ Database file: {config.DATABASE_FILE}")
+    print(f"✅ Role distributions: {len(config.ROLE_DISTRIBUTION)} configurations")
+    
     # Створити необхідні директорії
     Path("logs").mkdir(exist_ok=True)
     Path("gifs").mkdir(exist_ok=True)
+    
+    print("✅ Directories created/verified")
     
     # Перевірити наявність GIF файлів
     required_gifs = ["night.gif", "morning.gif", "vote.gif", "dead.gif", "lost_civil.gif", "lost_mafia.gif"]
@@ -1634,53 +1647,75 @@ def main() -> None:
     if missing_gifs:
         print(f"⚠️  WARNING: Missing GIF files: {', '.join(missing_gifs)}")
         print("Bot will work but will use text fallbacks instead of animations")
+    else:
+        print("✅ All GIF files present")
     
-    print("✅ All critical checks passed")
-    print("🚀 Starting Mafia Bot...")
+    print("\n" + "="*60)
+    print("🚀 Starting Telegram Bot...")
+    print("="*60 + "\n")
     
-    application = (
-        Application.builder()
-        .token(config.BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-    
-    # Register command handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("profile", profile_command))
-    application.add_handler(CommandHandler("shop", shop_command))
-    application.add_handler(CommandHandler("newgame", newgame_command))
-    application.add_handler(CommandHandler("cancelgame", cancelgame_command))
-    application.add_handler(CommandHandler("status", status_command))
-    
-    # Register callback handlers
-    application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
-    application.add_handler(CallbackQueryHandler(lobby_callback, pattern="^lobby_"))
-    application.add_handler(CallbackQueryHandler(night_action_callback, pattern="^(don_kill_|doc_heal_|detective_|det_|potato_|petrushka_)"))
-    application.add_handler(CallbackQueryHandler(voting_callback, pattern="^lynch_"))
-    application.add_handler(CallbackQueryHandler(nomination_callback, pattern="^nominate_"))
-    application.add_handler(CallbackQueryHandler(confirmation_callback, pattern="^confirm_"))
-    application.add_handler(CallbackQueryHandler(shop_callback, pattern="^shop_buy_"))
-    
-    # Message handlers (порядок важливий!)
-    application.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-        handle_last_words_message
-    ))
-    
-    application.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-        handle_mafia_chat_message
-    ))
-    
-    application.add_handler(MessageHandler(
-        filters.ChatType.GROUPS & ~filters.COMMAND,
-        handle_group_message
-    ))
-    
-    # Global error handler
-    application.add_error_handler(error_handler)
-    
-    logger.info("✅ Bot started successfully!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        application = (
+            Application.builder()
+            .token(config.BOT_TOKEN)
+            .post_init(post_init)
+            .post_shutdown(post_shutdown)
+            .build()
+        )
+        
+        # Register command handlers
+        print("📝 Registering handlers...")
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("profile", profile_command))
+        application.add_handler(CommandHandler("shop", shop_command))
+        application.add_handler(CommandHandler("newgame", newgame_command))
+        application.add_handler(CommandHandler("cancelgame", cancelgame_command))
+        application.add_handler(CommandHandler("status", status_command))
+        
+        # Register callback handlers
+        application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
+        application.add_handler(CallbackQueryHandler(lobby_callback, pattern="^lobby_"))
+        application.add_handler(CallbackQueryHandler(night_action_callback, pattern="^(don_kill_|doc_heal_|detective_|det_|potato_|petrushka_)"))
+        application.add_handler(CallbackQueryHandler(voting_callback, pattern="^lynch_"))
+        application.add_handler(CallbackQueryHandler(nomination_callback, pattern="^nominate_"))
+        application.add_handler(CallbackQueryHandler(confirmation_callback, pattern="^confirm_"))
+        application.add_handler(CallbackQueryHandler(shop_callback, pattern="^shop_buy_"))
+        
+        # Message handlers
+        application.add_handler(MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+            handle_last_words_message
+        ))
+        
+        application.add_handler(MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+            handle_mafia_chat_message
+        ))
+        
+        application.add_handler(MessageHandler(
+            filters.ChatType.GROUPS & ~filters.COMMAND,
+            handle_group_message
+        ))
+        
+        # Global error handler
+        application.add_error_handler(error_handler)
+        
+        print("✅ All handlers registered")
+        print("\n" + "="*60)
+        print("✅ BOT IS RUNNING!")
+        print("="*60)
+        print("Press Ctrl+C to stop")
+        print("="*60 + "\n")
+        
+        # Start polling
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+    except Exception as e:
+        print(f"\n❌ FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

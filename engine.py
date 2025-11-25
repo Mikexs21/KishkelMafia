@@ -450,7 +450,14 @@ async def notify_mafia_team(game: GameState, context: ContextTypes.DEFAULT_TYPE)
                 logger.error(f"Failed to send mafia team info to {member.username}: {e}")
 
 
-aasync def distribute_roles(game: GameState) -> None:
+# Виправлення для engine.py, лінія 453
+# Змініть цей рядок:
+
+# НЕПРАВИЛЬНО:
+# aasync def distribute_roles(game: GameState) -> None:
+
+# ПРАВИЛЬНО:
+async def distribute_roles(game: GameState) -> None:
     """Distribute roles to players with proper validation."""
     player_count = len(game.players)
     
