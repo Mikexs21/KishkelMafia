@@ -159,3 +159,24 @@ LOG_BOT_ACTIONS = True
 # Зберігати лог у файл
 SAVE_LOG_TO_FILE = False  # True якщо потрібно
 LOG_FILE_PATH = "mafia_bot.log"
+
+DATABASE_FILE = "mafia_bot.db"
+
+# ====================================================
+# ROLE DISTRIBUTION (КРИТИЧНО!)
+# ====================================================
+ALLOW_PETRUSHKA = True
+
+ROLE_DISTRIBUTION = {
+    5: ["don", "doctor", "detective", "civilian", "civilian"],
+    6: ["don", "mafia", "doctor", "detective", "civilian", "civilian"],
+    7: ["don", "mafia", "doctor", "detective", "mayor", "civilian", "civilian"],
+    8: ["don", "mafia", "doctor", "detective", "deputy", "mayor", "civilian", "civilian"],
+    9: ["don", "mafia", "doctor", "detective", "deputy", "mayor", "civilian", "civilian", "civilian"],
+    10: ["don", "mafia", "mafia", "doctor", "detective", "deputy", "consigliere", "mayor", "civilian", "civilian"],
+    11: ["don", "mafia", "mafia", "doctor", "detective", "deputy", "consigliere", "mayor", "executioner", "civilian", "civilian"],
+    12: ["don", "mafia", "mafia", "doctor", "detective", "deputy", "consigliere", "mayor", "executioner", "petrushka", "civilian", "civilian"],
+    13: ["don", "mafia", "mafia", "doctor", "detective", "deputy", "consigliere", "mayor", "executioner", "petrushka", "civilian", "civilian", "civilian"],
+    14: ["don", "mafia", "mafia", "mafia", "doctor", "detective", "deputy", "consigliere", "mayor", "executioner", "petrushka", "civilian", "civilian", "civilian"],
+    15: ["don", "mafia", "mafia", "mafia", "doctor", "detective", "deputy", "consigliere", "mayor", "executioner", "petrushka", "civilian", "civilian", "civilian", "civilian"]
+}

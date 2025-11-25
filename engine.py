@@ -450,25 +450,42 @@ async def notify_mafia_team(game: GameState, context: ContextTypes.DEFAULT_TYPE)
                 logger.error(f"Failed to send mafia team info to {member.username}: {e}")
 
 
-async def distribute_roles(game: GameState) -> None:
-    """Distribute roles to players."""
+aasync def distribute_roles(game: GameState) -> None:
+    """Distribute roles to players with proper validation."""
     player_count = len(game.players)
     
-    # Get role distribution
-    if player_count in config.ROLE_DISTRIBUTION:
+    # Перевірка наявності конфігурації
+    if not hasattr(config, 'ROLE_DISTRIBUTION'):
+        logger.error("ROLE_DISTRIBUTION not found in config!")
+        # Fallback на базовий розподіл
+        roles = ["don", "doctor", "detective"] + ["civilian"] * (player_count - 3)
+    elif player_count in config.ROLE_DISTRIBUTION:
         roles = config.ROLE_DISTRIBUTION[player_count].copy()
     else:
-        roles = ["don", "doctor", "detective"] + ["civilian"] * (player_count - 3)
+        logger.warning(f"No role distribution for {player_count} players, using fallback")
+        # Fallback логіка для нестандартної кількості
+        roles = ["don", "mafia", "doctor", "detective"] + ["civilian"] * max(0, player_count - 4)
     
     # Check for Petrushka
     if not config.ALLOW_PETRUSHKA:
         roles = [r if r != "petrushka" else "civilian" for r in roles]
     
+    # Перевірка кількості ролей
+    if len(roles) != player_count:
+        logger.error(f"Role count mismatch: {len(roles)} roles for {player_count} players")
+        # Додати або видалити civilian для вирівнювання
+        while len(roles) < player_count:
+            roles.append("civilian")
+        while len(roles) > player_count:
+            if "civilian" in roles:
+                roles.remove("civilian")
+            else:
+                roles.pop()
+    
     # Shuffle players
     player_ids = list(game.players.keys())
     random.shuffle(player_ids)
     
-    # 🔧 ВИПРАВЛЕНО: Handle buffs правильно
     detective_assigned = False
     
     # Спочатку обробляємо FORCE_DETECTIVE для людей
@@ -477,32 +494,38 @@ async def distribute_roles(game: GameState) -> None:
         if player.is_bot:
             continue
         
-        buffs = await db.get_user_buffs(player.telegram_id)
-        for buff in buffs:
-            if buff['buff_type'] == 'FORCE_DETECTIVE' and not detective_assigned:
-                if "detective" in roles:
-                    player.role = "detective"
-                    roles.remove("detective")
-                    detective_assigned = True
-                    logger.info(f"✅ Assigned Detective to {player.username} (FORCE_DETECTIVE buff)")
-                    break
+        try:
+            buffs = await db.get_user_buffs(player.telegram_id)
+            for buff in buffs:
+                if buff['buff_type'] == 'FORCE_DETECTIVE' and not detective_assigned:
+                    if "detective" in roles:
+                        player.role = "detective"
+                        roles.remove("detective")
+                        detective_assigned = True
+                        logger.info(f"✅ Assigned Detective to {player.username} (FORCE_DETECTIVE buff)")
+                        break
+        except Exception as e:
+            logger.error(f"Error checking buffs for {player.username}: {e}")
     
     # Потім обробляємо ACTIVE_ROLE для людей
     for pid in player_ids:
         player = game.players[pid]
-        if player.is_bot or player.role:  # Пропускаємо якщо вже має роль
+        if player.is_bot or player.role:
             continue
         
-        buffs = await db.get_user_buffs(player.telegram_id)
-        for buff in buffs:
-            if buff['buff_type'] == 'ACTIVE_ROLE':
-                active_roles = [r for r in roles if r not in ['civilian', 'petrushka', 'detective']]
-                if active_roles:
-                    role = random.choice(active_roles)
-                    player.role = role
-                    roles.remove(role)
-                    logger.info(f"✅ Assigned {role} to {player.username} (ACTIVE_ROLE buff)")
-                    break
+        try:
+            buffs = await db.get_user_buffs(player.telegram_id)
+            for buff in buffs:
+                if buff['buff_type'] == 'ACTIVE_ROLE':
+                    active_roles = [r for r in roles if r not in ['civilian', 'petrushka', 'detective']]
+                    if active_roles:
+                        role = random.choice(active_roles)
+                        player.role = role
+                        roles.remove(role)
+                        logger.info(f"✅ Assigned {role} to {player.username} (ACTIVE_ROLE buff)")
+                        break
+        except Exception as e:
+            logger.error(f"Error checking buffs for {player.username}: {e}")
     
     # Shuffle remaining roles
     random.shuffle(roles)
@@ -510,16 +533,16 @@ async def distribute_roles(game: GameState) -> None:
     # Assign remaining roles
     for pid in player_ids:
         player = game.players[pid]
-        if player.role:  # Вже має роль з бафів
+        if player.role:
             continue
         
         if not roles:
             player.role = "civilian"
-            logger.info(f"Assigned civilian to {player.username} (no roles left)")
+            logger.warning(f"No roles left, assigned civilian to {player.username}")
             continue
         
         if player.is_bot:
-            # 🔧 ВИПРАВЛЕНО: Боти НІКОЛИ не можуть бути детективом
+            # Боти не можуть бути детективом
             available = [r for r in roles if r != "detective"]
             if available:
                 role = random.choice(available)
@@ -1671,7 +1694,11 @@ async def run_timer(game: GameState, context: ContextTypes.DEFAULT_TYPE,
 # ====================================================
 
 async def check_win_condition(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if game has ended with detailed logging."""
+    """
+    Check if game has ended with detailed logging.
+    
+    КРИТИЧНО: Мафія виграє при ПАРИТЕТІ (>=), а не при більшості (>)
+    """
     mafia_roles = {"don", "mafia", "consigliere"}
     
     # Count with detailed logging
@@ -1688,19 +1715,19 @@ async def check_win_condition(game: GameState, context: ContextTypes.DEFAULT_TYP
     mafia_alive = len(mafia_list)
     civilian_alive = len(civilian_list)
     
-    logger.info(f"🔍 Win check:")
+    logger.info(f"🔍 Win check - Game #{game.game_id}, Round {game.round_num}:")
     logger.info(f"  🔴 Mafia ({mafia_alive}): {', '.join(mafia_list) if mafia_list else 'None'}")
     logger.info(f"  🔵 Civilians ({civilian_alive}): {', '.join(civilian_list) if civilian_list else 'None'}")
     
-    # Mafia wins if >= civilians (parity control)
+    # Мафія виграє якщо >= мирних (ПАРИТЕТ!)
     if mafia_alive > 0 and mafia_alive >= civilian_alive:
-        logger.info(f"🏴 MAFIA WINS by parity!")
+        logger.info(f"🏴 MAFIA WINS by parity control! ({mafia_alive} >= {civilian_alive})")
         await end_game(game, context, "mafia")
         return True
     
-    # Civilians win if no mafia
+    # Мирні виграють якщо мафії немає
     if mafia_alive == 0:
-        logger.info(f"✨ CIVILIANS WIN!")
+        logger.info(f"✨ CIVILIANS WIN! No mafia left")
         await end_game(game, context, "civilians")
         return True
     
@@ -2413,20 +2440,25 @@ async def handle_detective_check_callback(game: GameState, player: PlayerState,
 
 async def handle_detective_shoot_callback(game: GameState, player: PlayerState, 
                                           target_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Detective's shoot choice with STRICT validation."""
+    """
+    Handle Detective's shoot choice with STRICT validation.
     
-    # 🔧 ВИПРАВЛЕНО: СТРОГА перевірка на початку
+    КРИТИЧНА ПОМИЛКА: Детектив міг стріляти двічі через race condition
+    """
+    
+    # СТРОГА перевірка на початку
     if player.has_used_gun:
         logger.warning(f"⚠️ {player.username} спробував стріляти ЗНОВУ (заблоковано)")
         try:
             await context.bot.send_message(
                 player.telegram_id,
-                "❌ <b>Помилка!</b>\n\nТи вже використав пістолет раніше!\n\n"
+                "❌ <b>Помилка!</b>\n\n"
+                "Ти вже використав пістолет раніше!\n\n"
                 "Можеш тільки перевіряти ролі.",
                 parse_mode='HTML'
             )
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to send gun reuse error: {e}")
         return
     
     # Перевірка фази
@@ -2439,6 +2471,11 @@ async def handle_detective_shoot_callback(game: GameState, player: PlayerState,
         logger.warning(f"⚠️ {player.username} спробував стріляти будучи мертвим")
         return
     
+    # Перевірка що ціль існує
+    if target_id not in game.players:
+        logger.error(f"⚠️ {player.username} обрав неіснуючу ціль: {target_id}")
+        return
+    
     # Виконуємо постріл
     game.detective_shoot_target = target_id
     player.has_acted_this_night = True
@@ -2447,22 +2484,18 @@ async def handle_detective_shoot_callback(game: GameState, player: PlayerState,
     target = game.players[target_id]
     logger.info(f"🔫 {player.username} ВИСТРІЛИВ у {target.username} (пістолет використано)")
     
-    await safe_send_message(
-        context,
-        player.telegram_id,
-        "🔫 <b>Постріл здійснено!</b>\n\n"
-        "Пістолет тепер порожній. Вранці дізнаєшся результат.\n\n"
-        "<i>Більше стріляти не зможеш.</i>",
-        parse_mode='HTML'
-    )
+    try:
+        await context.bot.send_message(
+            player.telegram_id,
+            "🔫 <b>Постріл здійснено!</b>\n\n"
+            "Пістолет тепер порожній. Вранці дізнаєшся результат.\n\n"
+            "<i>Більше стріляти не зможеш.</i>",
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        logger.error(f"Failed to send shoot confirmation: {e}")
     
-    await safe_send_message(
-        context,
-        game.group_chat_id,
-        "🔫 Детектив зробив свій вибір...",
-        parse_mode='HTML'
-    )
-    
+    await log_action_in_group(game, context, "detective_chose")
     await check_all_night_actions_done(game, context)
 
 async def handle_potato_throw_callback(game: GameState, player: PlayerState, 

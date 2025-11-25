@@ -50,6 +50,52 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+class ColoredFormatter(logging.Formatter):
+    """Colored log formatter for better readability."""
+    
+    COLORS = {
+        'DEBUG': '\033[36m',     # Cyan
+        'INFO': '\033[32m',      # Green
+        'WARNING': '\033[33m',   # Yellow
+        'ERROR': '\033[31m',     # Red
+        'CRITICAL': '\033[35m',  # Magenta
+    }
+    RESET = '\033[0m'
+    
+    def format(self, record):
+        log_color = self.COLORS.get(record.levelname, self.RESET)
+        record.levelname = f"{log_color}{record.levelname}{self.RESET}"
+        return super().format(record)
+
+# Замінити базове налаштування логування на:
+Path("logs").mkdir(exist_ok=True)
+
+# Console handler з кольорами
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(ColoredFormatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
+))
+
+# File handler без кольорів
+file_handler = logging.FileHandler('logs/mafia_bot.log', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+))
+
+# Налаштувати root logger
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[console_handler, file_handler]
+)
+
+# Приглушити сторонні бібліотеки
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
 
 # ====================================================
 # ЛОГУВАННЯ (ВИПРАВЛЕНО)
@@ -1538,13 +1584,59 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             else:
                 logger.error(f"Failed to delete message: {e}")
 
-
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler for unhandled exceptions."""
+    logger.error(f"Exception while handling an update:", exc_info=context.error)
+    
+    # Спробувати повідомити користувача
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                "😵 <b>Щось пішло не так...</b>\n\n"
+                "Спробуй ще раз або напиши /start",
+                parse_mode='HTML'
+            )
+    except Exception as e:
+        logger.error(f"Failed to send error message to user: {e}")
 
 def main() -> None:
-    """Start the bot."""
-    if config.BOT_TOKEN == "PASTE_TOKEN_HERE":
-        print("ERROR: Please set BOT_TOKEN in config.py")
+    """Start the bot with proper error handling."""
+    
+    # Перевірка токена
+    if not hasattr(config, 'BOT_TOKEN') or not config.BOT_TOKEN:
+        print("❌ ERROR: BOT_TOKEN not found in config.py")
+        print("Please set BOT_TOKEN in config.py or environment variables")
         return
+    
+    if config.BOT_TOKEN == "PASTE_TOKEN_HERE":
+        print("❌ ERROR: Please replace BOT_TOKEN in config.py with your actual token")
+        return
+    
+    # Перевірка критичних констант
+    if not hasattr(config, 'DATABASE_FILE'):
+        print("❌ ERROR: DATABASE_FILE not found in config.py")
+        print("Add: DATABASE_FILE = 'mafia_bot.db'")
+        return
+    
+    if not hasattr(config, 'ROLE_DISTRIBUTION'):
+        print("❌ ERROR: ROLE_DISTRIBUTION not found in config.py")
+        print("Please add ROLE_DISTRIBUTION dictionary")
+        return
+    
+    # Створити необхідні директорії
+    Path("logs").mkdir(exist_ok=True)
+    Path("gifs").mkdir(exist_ok=True)
+    
+    # Перевірити наявність GIF файлів
+    required_gifs = ["night.gif", "morning.gif", "vote.gif", "dead.gif", "lost_civil.gif", "lost_mafia.gif"]
+    missing_gifs = [gif for gif in required_gifs if not Path(f"gifs/{gif}").exists()]
+    
+    if missing_gifs:
+        print(f"⚠️  WARNING: Missing GIF files: {', '.join(missing_gifs)}")
+        print("Bot will work but will use text fallbacks instead of animations")
+    
+    print("✅ All critical checks passed")
+    print("🚀 Starting Mafia Bot...")
     
     application = (
         Application.builder()
@@ -1571,27 +1663,24 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(confirmation_callback, pattern="^confirm_"))
     application.add_handler(CallbackQueryHandler(shop_callback, pattern="^shop_buy_"))
     
-    # 🔧 ВИПРАВЛЕНО: Правильний порядок хендлерів для DM
-    # 1️⃣ Останні слова (вищий пріоритет)
+    # Message handlers (порядок важливий!)
     application.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
         handle_last_words_message
     ))
     
-    # 2️⃣ Мафія-чат (нижчий пріоритет)
     application.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
         handle_mafia_chat_message
     ))
     
-    # 3️⃣ Групові повідомлення (без фільтру TEXT щоб ловити стікери/гіфки)
     application.add_handler(MessageHandler(
         filters.ChatType.GROUPS & ~filters.COMMAND,
         handle_group_message
     ))
     
-    logger.info("Starting bot...")
+    # Global error handler
+    application.add_error_handler(error_handler)
+    
+    logger.info("✅ Bot started successfully!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    main()
