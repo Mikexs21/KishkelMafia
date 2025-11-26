@@ -1176,7 +1176,7 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
     """
     Resolve all night actions.
     
-    ✅ НОВА ЛОГІКА:
+    ✅ ВИПРАВЛЕНА ЛОГІКА:
     1. Збираємо потенційні смерті
     2. Застосовуємо лікаря
     3. Повідомляємо жертв (врятовані/помираючі)
@@ -1186,11 +1186,7 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
     
     logger.info(visual.format_game_log(game.game_id, game.round_num, "NIGHT", "🌙 Розв'язуємо ніч"))
     
-    events = []
-    
-    # ========================================
     # КРОК 1: Збираємо потенційні смерті
-    # ========================================
     potential_deaths = set()
     
     if game.don_target:
@@ -1226,9 +1222,7 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             await asyncio.sleep(0.5)
     
-    # ========================================
     # КРОК 2: Застосовуємо лікаря
-    # ========================================
     saved_player_id = None
     
     if game.doctor_target and game.doctor_target in potential_deaths:
@@ -1246,9 +1240,7 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
                         saves=1
                     )
     
-    # ========================================
     # КРОК 3: Повідомляємо жертв про замахи
-    # ========================================
     attempted_targets = []
     if game.don_target:
         attempted_targets.append(game.don_target)
@@ -1292,17 +1284,13 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as e:
             logger.error(f"Помилка повідомлення {target.username}: {e}")
     
-    # ========================================
     # КРОК 4: Чекаємо останні слова
-    # ========================================
     if game.awaiting_last_words and config.LAST_WORDS_ENABLED:
         logger.info(f"⏳ Чекаємо {config.LAST_WORDS_TIMEOUT}с на останні слова")
         await asyncio.sleep(config.LAST_WORDS_TIMEOUT)
         logger.info(f"✅ Отримано {len(game.last_words)} останніх слів")
     
-    # ========================================
     # КРОК 5: Застосовуємо смерті
-    # ========================================
     deaths = list(potential_deaths)
     
     for pid in deaths:
@@ -1314,6 +1302,7 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
             await db.update_game_player_stats(player.db_player_id, is_alive=0)
         
         # Bot AI learns
+        from bot_ai import bot_ai
         for bot_pid in game.player_order:
             bot = game.players[bot_pid]
             if bot.is_bot and bot.is_alive:
@@ -1330,9 +1319,7 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
                             kills=1
                         )
     
-    # ========================================
     # КРОК 6: Надіслати результати перевірок
-    # ========================================
     for checker_id, (target_id, target_role) in game.check_results.items():
         checker = game.players[checker_id]
         target = game.players[target_id]
@@ -1351,14 +1338,11 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception as e:
                 logger.error(f"Помилка перевірки: {e}")
     
-    # ========================================
     # КРОК 7: Надіслати повідомлення про дії
-    # ========================================
     await send_night_notifications(game, context, deaths, saved_player_id)
     
-    # ========================================
     # КРОК 8: Визначити події
-    # ========================================
+    events = []
     if len(deaths) == 0:
         if saved_player_id:
             events.append("doc_saved")
@@ -1382,9 +1366,7 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         events.append("event_both_died")
     
-    # ========================================
     # КРОК 9: Перехід до дня
-    # ========================================
     if hasattr(game, '_day_started') and game._day_started:
         logger.warning("⚠️ День вже почався")
         return
@@ -2697,61 +2679,90 @@ async def handle_detective_shoot_callback(game: GameState, player: PlayerState,
                                           target_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle Detective's shoot choice with STRICT validation.
-    
-    КРИТИЧНА ПОМИЛКА: Детектив міг стріляти двічі через race condition
     """
     
-    # СТРОГА перевірка на початку
-    if player.has_used_gun:
-        logger.warning(f"⚠️ {player.username} спробував стріляти ЗНОВУ (заблоковано)")
+    # ✅ FIX #1: LOCK для запобігання race condition
+    if not hasattr(game, '_detective_shoot_lock'):
+        game._detective_shoot_lock = asyncio.Lock()
+    
+    # ✅ FIX #2: Спробувати отримати lock
+    if game._detective_shoot_lock.locked():
+        logger.warning(f"⚠️ {player.username} спробував стріляти під час іншого пострілу")
         try:
             await context.bot.send_message(
                 player.telegram_id,
-                "❌ <b>Помилка!</b>\n\n"
-                "Ти вже використав пістолет раніше!\n\n"
-                "Можеш тільки перевіряти ролі.",
+                "❌ Зачекай, постріл вже обробляється!",
+                parse_mode='HTML'
+            )
+        except:
+            pass
+        return
+    
+    async with game._detective_shoot_lock:
+        # ✅ FIX #3: СТРОГА перевірка на початку (під lock)
+        if player.has_used_gun:
+            logger.warning(f"⚠️ {player.username} спробував стріляти ЗНОВУ (заблоковано)")
+            try:
+                await context.bot.send_message(
+                    player.telegram_id,
+                    "❌ <b>Помилка!</b>\n\n"
+                    "Ти вже використав пістолет раніше!\n\n"
+                    "Можеш тільки перевіряти ролі.",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            return
+        
+        # Перевірка фази
+        if game.phase != Phase.NIGHT:
+            logger.warning(f"⚠️ {player.username} спробував стріляти не вночі")
+            return
+        
+        # Перевірка що гравець живий
+        if not player.is_alive:
+            logger.warning(f"⚠️ {player.username} спробував стріляти будучи мертвим")
+            return
+        
+        # Перевірка що ціль існує
+        if target_id not in game.players:
+            logger.error(f"⚠️ {player.username} обрав неіснуючу ціль: {target_id}")
+            return
+        
+        # ✅ FIX #4: ЗАБОРОНА САМОГУБСТВА
+        if target_id == player.player_id:
+            try:
+                await context.bot.send_message(
+                    player.telegram_id,
+                    "❌ Не можна стріляти в себе!\n\nЦе самогубство! 🔫🚫",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            return
+        
+        # ✅ FIX #5: Виконуємо постріл ТА ОДРАЗУ ВСТАНОВЛЮЄМО ПРАПОРЕЦЬ
+        player.has_used_gun = True  # ← КРИТИЧНО: ДО присвоєння target
+        game.detective_shoot_target = target_id
+        player.has_acted_this_night = True
+        
+        target = game.players[target_id]
+        logger.info(f"🔫 {player.username} ВИСТРІЛИВ у {target.username} (пістолет використано)")
+        
+        try:
+            await context.bot.send_message(
+                player.telegram_id,
+                "🔫 <b>Постріл здійснено!</b>\n\n"
+                "Пістолет тепер порожній. Вранці дізнаєшся результат.\n\n"
+                "<i>Більше стріляти не зможеш.</i>",
                 parse_mode='HTML'
             )
         except Exception as e:
-            logger.error(f"Failed to send gun reuse error: {e}")
-        return
-    
-    # Перевірка фази
-    if game.phase != Phase.NIGHT:
-        logger.warning(f"⚠️ {player.username} спробував стріляти не вночі")
-        return
-    
-    # Перевірка що гравець живий
-    if not player.is_alive:
-        logger.warning(f"⚠️ {player.username} спробував стріляти будучи мертвим")
-        return
-    
-    # Перевірка що ціль існує
-    if target_id not in game.players:
-        logger.error(f"⚠️ {player.username} обрав неіснуючу ціль: {target_id}")
-        return
-    
-    # Виконуємо постріл
-    game.detective_shoot_target = target_id
-    player.has_acted_this_night = True
-    player.has_used_gun = True  # КРИТИЧНО: встановлюємо прапорець
-    
-    target = game.players[target_id]
-    logger.info(f"🔫 {player.username} ВИСТРІЛИВ у {target.username} (пістолет використано)")
-    
-    try:
-        await context.bot.send_message(
-            player.telegram_id,
-            "🔫 <b>Постріл здійснено!</b>\n\n"
-            "Пістолет тепер порожній. Вранці дізнаєшся результат.\n\n"
-            "<i>Більше стріляти не зможеш.</i>",
-            parse_mode='HTML'
-        )
-    except Exception as e:
-        logger.error(f"Failed to send shoot confirmation: {e}")
-    
-    await log_action_in_group(game, context, "detective_chose")
-    await check_all_night_actions_done(game, context)
+            logger.error(f"Failed to send shoot confirmation: {e}")
+        
+        from engine import log_action_in_group, check_all_night_actions_done
+        await log_action_in_group(game, context, "detective_chose")
+        await check_all_night_actions_done(game, context)
 
 async def handle_potato_throw_callback(game: GameState, player: PlayerState, 
                                        target_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:

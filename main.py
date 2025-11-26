@@ -29,6 +29,8 @@ from button_protection import (
     shop_callback
 )
 
+from engine import handle_group_message
+
 import config
 import db
 import visual
@@ -234,13 +236,23 @@ async def handle_mafia_chat_message(update: Update, context: ContextTypes.DEFAUL
     user_id = update.effective_user.id
     message_text = update.message.text
     
+    # ✅ FIX #1: Перевірка довжини НА ПОЧАТКУ
+    if len(message_text) > 200:
+        await update.message.reply_text(
+            f"❌ Повідомлення занадто довге! Максимум 200 символів.\n\n"
+            f"Зараз: {len(message_text)} символів"
+        )
+        return
+    
     # Find game and player
     game = None
     player = None
     
     for g in game_manager.games.values():
+        # ✅ FIX #2: Перевірка фази
         if g.phase != Phase.NIGHT:
             continue
+            
         for p in g.players.values():
             if p.telegram_id == user_id:
                 game = g
@@ -257,15 +269,15 @@ async def handle_mafia_chat_message(update: Update, context: ContextTypes.DEFAUL
     if player.role not in mafia_roles:
         return
     
-    # Перевірка чи гравець живий
+    # ✅ FIX #3: Перевірка чи гравець живий
     if not player.is_alive:
         try:
             await context.bot.delete_message(
                 update.effective_chat.id, 
                 update.message.message_id
             )
-        except Exception as e:
-            logger.debug(f"Не вдалося видалити повідомлення мертвого: {e}")
+        except:
+            pass
         return
     
     # Check if already sent
@@ -273,14 +285,6 @@ async def handle_mafia_chat_message(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text(
             "❌ Ти вже відправив повідомлення команді цієї ночі!\n\n"
             "Можна відправити тільки ОДНЕ повідомлення за ніч."
-        )
-        return
-    
-    # Check length
-    if len(message_text) > 200:
-        await update.message.reply_text(
-            f"❌ Повідомлення занадто довге! Максимум 200 символів.\n\n"
-            f"Зараз: {len(message_text)} символів"
         )
         return
     
@@ -299,7 +303,7 @@ async def handle_mafia_chat_message(update: Update, context: ContextTypes.DEFAUL
     # Send to all mafia members
     for p in game.players.values():
         if p.role in mafia_roles and p.player_id != player.player_id:
-            if not p.is_bot and p.telegram_id:
+            if not p.is_bot and p.telegram_id and p.is_alive:  # ✅ FIX #4: Перевірка is_alive
                 try:
                     await context.bot.send_message(
                         p.telegram_id,
@@ -311,8 +315,40 @@ async def handle_mafia_chat_message(update: Update, context: ContextTypes.DEFAUL
                     logger.error(f"Помилка надсилання мафія-чату до {p.username}: {e}")
 
 
+async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Unified handler for private messages.
+    Routes to last words or mafia chat depending on game state.
+    """
+    if not update.message or not update.message.text:
+        return
+    
+    user_id = update.effective_user.id
+    
+    # Спочатку перевірити останні слова (вищий пріоритет)
+    for g in game_manager.games.values():
+        if g.phase != Phase.NIGHT:
+            continue
+        for p in g.players.values():
+            if p.telegram_id == user_id and p.player_id in g.awaiting_last_words:
+                # Це останні слова
+                await handle_last_words_message(update, context)
+                return
+    
+    # Якщо не останні слова - можливо мафія-чат
+    for g in game_manager.games.values():
+        if g.phase != Phase.NIGHT:
+            continue
+        for p in g.players.values():
+            if p.telegram_id == user_id and p.role in {"don", "mafia", "consigliere"}:
+                # Це мафія-чат
+                await handle_mafia_chat_message(update, context)
+                return
+
+
 async def handle_last_words_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle last words from dying players - ВИПРАВЛЕНА ВЕРСІЯ."""
+    # ✅ FIX #1: Перевірка типу чату
     if update.effective_chat.type != 'private':
         return
     
@@ -322,11 +358,15 @@ async def handle_last_words_message(update: Update, context: ContextTypes.DEFAUL
     user_id = update.effective_user.id
     message_text = update.message.text
     
-    # Find game and player
+    # ✅ FIX #2: Перевірка що це саме останні слова
     game = None
     player = None
     
     for g in game_manager.games.values():
+        # ✅ FIX #3: Перевірка фази (має бути NIGHT)
+        if g.phase != Phase.NIGHT:
+            continue
+            
         for p in g.players.values():
             if p.telegram_id == user_id and p.player_id in g.awaiting_last_words:
                 game = g
@@ -368,67 +408,6 @@ async def handle_last_words_message(update: Update, context: ContextTypes.DEFAUL
     
     logger.info(f"💬 Останні слова від {player.username}: {message_text[:50]}...")
 
-async def handle_last_words_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle last words from dying players - ВИПРАВЛЕНА ВЕРСІЯ."""
-    if update.effective_chat.type != 'private':
-        return
-    
-    if not update.message:
-        return
-    
-    # Дозволяємо ТІЛЬКИ текст
-    if not update.message.text:
-        return
-    
-    user_id = update.effective_user.id
-    message_text = update.message.text
-    
-    # Find game and player
-    game = None
-    player = None
-    
-    for g in game_manager.games.values():
-        for p in g.players.values():
-            if p.telegram_id == user_id and p.player_id in g.awaiting_last_words:
-                game = g
-                player = p
-                break
-        if game:
-            break
-    
-    if not game or not player:
-        # Не знайдено гравця який очікує на останні слова
-        return
-    
-    # Перевірка чи не надіслав вже
-    if player.player_id in game.last_words:
-        await update.message.reply_text(
-            "ℹ️ Ти вже надіслав свої останні слова!",
-            parse_mode='HTML'
-        )
-        return
-    
-    # Check length
-    if len(message_text) > 200:
-        await update.message.reply_text(
-            "❌ Занадто довго! Максимум 200 символів.\n\n"
-            f"Зараз: {len(message_text)} символів",
-            parse_mode='HTML'
-        )
-        return
-    
-    # Save last words
-    game.last_words[player.player_id] = message_text
-    game.awaiting_last_words.remove(player.player_id)
-    
-    await update.message.reply_text(
-        "✅ <b>Твої останні слова записані!</b>\n\n"
-        "Всі гравці побачать їх вранці.\n\n"
-        f"<i>Твоє повідомлення: \"{message_text[:50]}{'...' if len(message_text) > 50 else ''}\"</i>",
-        parse_mode='HTML'
-    )
-    
-    logger.info(f"💬 Останні слова від {player.username}: {message_text[:50]}...")
 
 
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1615,7 +1594,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             else:
                 logger.error(f"Failed to delete message: {e}")
 
-sync def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Global error handler for unhandled exceptions."""
     logger.error(f"Exception while handling an update:", exc_info=context.error)
     
@@ -1715,17 +1694,15 @@ def main() -> None:
         # Message handlers
         application.add_handler(MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-            handle_last_words_message
+            handle_private_message
+
         ))
-        
-        application.add_handler(MessageHandler(
-            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-            handle_mafia_chat_message
-        ))
-        
+
         application.add_handler(MessageHandler(
             filters.ChatType.GROUPS & ~filters.COMMAND,
             handle_group_message
+
+        
         ))
         
         # Global error handler
