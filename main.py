@@ -4,7 +4,7 @@ import random
 import os
 import signal
 import sys
-from datetime import datetime  # ← ДОДАНО для log функцій
+from datetime import datetime
 from engine import safe_send_message, safe_send_animation
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -33,6 +33,8 @@ import config
 import db
 import visual
 
+from engine import safe_send_message, safe_send_animation, _flood_controller
+from engine import _flood_controller
 from engine import (
     game_manager,
     Phase,
@@ -314,11 +316,7 @@ async def handle_last_words_message(update: Update, context: ContextTypes.DEFAUL
     if update.effective_chat.type != 'private':
         return
     
-    if not update.message:
-        return
-    
-    # Дозволяємо ТІЛЬКИ текст
-    if not update.message.text:
+    if not update.message or not update.message.text:
         return
     
     user_id = update.effective_user.id
@@ -338,10 +336,9 @@ async def handle_last_words_message(update: Update, context: ContextTypes.DEFAUL
             break
     
     if not game or not player:
-        # Не знайдено гравця який очікує на останні слова
         return
     
-    # 🔧 ВИПРАВЛЕНО: Перевірка чи не надіслав вже
+    # Перевірка чи не надіслав вже
     if player.player_id in game.last_words:
         await update.message.reply_text(
             "ℹ️ Ти вже надіслав свої останні слова!",
@@ -815,7 +812,7 @@ async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             pass
         return
     
-    # 🔧 ВИПРАВЛЕНО: Захист від повторних кліків (крім вибору дії детектива)
+    # 🔧 ВИПРАВЛЕНО: Захист від повторних кліків
     if data not in ["detective_check", "detective_shoot"]:
         if player.has_acted_this_night:
             try:
@@ -833,7 +830,7 @@ async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         if "too old" not in error_msg and "expired" not in error_msg:
             logger.warning(f"Query answer помилка (некритично): {e}")
     
-    # Handle action
+    # Handle actions
     if data.startswith("don_kill_"):
         target_id = data.replace("don_kill_", "")
         logger.info(f"☠️ {player.username} обирає жертву: {game.players[target_id].username}")
@@ -855,7 +852,6 @@ async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         )
     
     elif data == "detective_shoot":
-        # 🔧 ВИПРАВЛЕНО: СТРОГА перевірка has_used_gun
         if player.has_used_gun:
             try:
                 await query.answer(
@@ -863,7 +859,7 @@ async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
                     "Можеш тільки перевіряти ролі.",
                     show_alert=True
                 )
-                logger.warning(f"⚠️ {player.username} спробував стріляти ЗНОВУ (заблоковано в callback)")
+                logger.warning(f"⚠️ {player.username} спробував стріляти ЗНОВУ")
             except:
                 pass
             return
@@ -883,17 +879,40 @@ async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         logger.info(f"🔍 {player.username} перевіряє: {game.players[target_id].username}")
         await handle_detective_check_callback(game, player, target_id, context)
     
+    # ✅ FIX: ПРАВИЛЬНИЙ ВІДСТУП ТУТ (4 пробіли після elif)
     elif data.startswith("det_shoot_"):
-        # 🔧 ВИПРАВЛЕНО: Додаткова перевірка перед пострілом
+        # 🔒 ПЕРЕВІРКА 1: Чи не використав вже пістолет
         if player.has_used_gun:
             try:
                 await query.answer("❌ Ти вже використав пістолет!", show_alert=True)
-                logger.warning(f"⚠️ {player.username} спробував стріляти ЗНОВУ (заблоковано в det_shoot_)")
+                logger.warning(f"⚠️ {player.username} спробував стріляти ЗНОВУ")
             except:
                 pass
             return
         
         target_id = data.replace("det_shoot_", "")
+        
+        # 🔒 ПЕРЕВІРКА 2: Чи не стріляє в себе
+        if target_id == player.player_id:
+            try:
+                await query.answer(
+                    "❌ Не можна стріляти в себе!\n\n"
+                    "Це самогубство, а не розслідування! 🔫🚫", 
+                    show_alert=True
+                )
+                logger.warning(f"⚠️ {player.username} спробував ВИСТРІЛИТИ В СЕБЕ")
+            except:
+                pass
+            return
+        
+        # 🔒 ПЕРЕВІРКА 3: Ціль існує і жива
+        if target_id not in game.players or not game.players[target_id].is_alive:
+            try:
+                await query.answer("❌ Неправильна ціль!", show_alert=True)
+            except:
+                pass
+            return
+        
         logger.info(f"🔫 {player.username} СТРІЛЯЄ у: {game.players[target_id].username}")
         await handle_detective_shoot_callback(game, player, target_id, context)
     
@@ -920,42 +939,6 @@ async def night_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             target_id = data.replace("petrushka_", "")
             logger.info(f"🎪 {player.username} використовує Петрушку на: {game.players[target_id].username}")
             await handle_petrushka_callback(game, player, target_id, context)
-    elif data.startswith("det_shoot_"):
-    # 🔒 ПЕРЕВІРКА 1: Чи не використав вже
-    if player.has_used_gun:
-        try:
-            await query.answer("❌ Ти вже використав пістолет!", show_alert=True)
-            logger.warning(f"⚠️ {player.username} спробував стріляти ЗНОВУ")
-        except:
-            pass
-        return
-    
-    target_id = data.replace("det_shoot_", "")
-    
-    # 🔒 ПЕРЕВІРКА 2: Чи не стріляє в себе
-    if target_id == player.player_id:
-        try:
-            await query.answer(
-                "❌ Не можна стріляти в себе!\n\n"
-                "Це самогубство, а не розслідування! 🔫🚫", 
-                show_alert=True
-            )
-            logger.warning(f"⚠️ {player.username} спробував ВИСТРІЛИТИ В СЕБЕ (заблоковано)")
-        except:
-            pass
-        return
-    
-    # 🔒 ПЕРЕВІРКА 3: Ціль існує і жива
-    if target_id not in game.players or not game.players[target_id].is_alive:
-        try:
-            await query.answer("❌ Неправильна ціль!", show_alert=True)
-        except:
-            pass
-        return
-    
-    logger.info(f"🔫 {player.username} СТРІЛЯЄ у: {game.players[target_id].username}")
-    await handle_detective_shoot_callback(game, player, target_id, context)
-
 
 async def voting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle voting callbacks with flood control."""
@@ -1632,11 +1615,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             else:
                 logger.error(f"Failed to delete message: {e}")
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+sync def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Global error handler for unhandled exceptions."""
     logger.error(f"Exception while handling an update:", exc_info=context.error)
     
-    # Спробувати повідомити користувача
     try:
         if update and update.effective_message:
             await update.effective_message.reply_text(
@@ -1646,6 +1628,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
     except Exception as e:
         logger.error(f"Failed to send error message to user: {e}")
+
 
 # Додайте це в кінець main.py, замініть існуючу функцію main()
 
