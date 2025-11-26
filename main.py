@@ -18,15 +18,11 @@ from telegram.ext import (
     filters
 )
 
-from button_protection import (
+from button_protection_v2 import (
     button_protection,
-    prevent_duplicates,
-    lobby_callback,
-    night_action_callback,
     voting_callback,
     nomination_callback,
     confirmation_callback,
-    shop_callback
 )
 
 from engine import handle_group_message

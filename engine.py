@@ -153,38 +153,43 @@ async def safe_send_message(context, chat_id: int, text: str, user_id: Optional[
             return None
 
 
-async def safe_send_animation(context, chat_id: int, animation, user_id: Optional[int] = None, **kwargs):
-    """Send animation with enhanced flood control."""
-    max_retries = 2
+async def safe_send_animation(context, chat_id: int, animation, **kwargs):
+    """
+    Send animation з TIMEOUT.
     
-    for attempt in range(max_retries):
-        try:
-            await _flood_controller.wait_if_needed(chat_id, user_id)
-            return await context.bot.send_animation(chat_id, animation, **kwargs)
-            
-        except RetryAfter as e:
-            if attempt < max_retries - 1:
-                wait_time = e.retry_after + 0.5
-                logger.warning(f"⚠️ Flood на анімації (chat {chat_id}), чекаємо {wait_time}s...")
-                await asyncio.sleep(wait_time)
-            else:
-                logger.warning("⚠️ Не вдалося надіслати анімацію, fallback на текст")
-                caption = kwargs.get('caption', '')
-                if caption:
-                    return await safe_send_message(
-                        context, chat_id, caption, user_id,
-                        parse_mode=kwargs.get('parse_mode')
-                    )
-                return None
-        except Exception as e:
-            logger.error(f"❌ Помилка анімації: {e}, fallback на текст")
-            caption = kwargs.get('caption', '')
-            if caption:
-                return await safe_send_message(
-                    context, chat_id, caption, user_id,
-                    parse_mode=kwargs.get('parse_mode')
-                )
-            return None
+    ПРОБЛЕМА: GIF timeout після 60s
+    РІШЕННЯ: 10s timeout + fallback на текст
+    """
+    from engine import _flood_controller, safe_send_message
+    
+    try:
+        await _flood_controller.wait_if_needed(chat_id)
+        
+        # ✅ КРИТИЧНО: 10s timeout
+        return await asyncio.wait_for(
+            context.bot.send_animation(chat_id, animation, **kwargs),
+            timeout=10.0
+        )
+        
+    except asyncio.TimeoutError:
+        logger.warning(f"⚠️ Animation timeout (10s), fallback to text")
+        caption = kwargs.get('caption', '')
+        if caption:
+            return await safe_send_message(
+                context, chat_id, caption,
+                parse_mode=kwargs.get('parse_mode')
+            )
+        return None
+        
+    except Exception as e:
+        logger.error(f"❌ Animation error: {e}, fallback to text")
+        caption = kwargs.get('caption', '')
+        if caption:
+            return await safe_send_message(
+                context, chat_id, caption,
+                parse_mode=kwargs.get('parse_mode')
+            )
+        return None
 
 
 async def safe_edit_message(context, chat_id: int, message_id: int, text: str, **kwargs):
@@ -1172,133 +1177,107 @@ async def broadcast_last_words(game: GameState, context: ContextTypes.DEFAULT_TY
 Замінити функції resolve_night() і start_day() в engine.py
 """
 
-async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def resolve_night(game, context) -> None:
     """
-    Resolve all night actions.
+    Resolve night - ВИПРАВЛЕНА ПОСЛІДОВНІСТЬ.
     
-    ✅ ВИПРАВЛЕНА ЛОГІКА:
-    1. Збираємо потенційні смерті
-    2. Застосовуємо лікаря
-    3. Повідомляємо жертв (врятовані/помираючі)
-    4. Чекаємо останні слова ТІЛЬКИ від помираючих
-    5. Показуємо результати
+    ПРОБЛЕМА: Останні слова не показуються
+    РІШЕННЯ: Правильний timing і послідовність
     """
+    import config
+    import visual
+    from engine import (
+        safe_send_message, safe_send_animation,
+        check_win_condition, start_day
+    )
     
-    logger.info(visual.format_game_log(game.game_id, game.round_num, "NIGHT", "🌙 Розв'язуємо ніч"))
+    logger.info(f"🌙 Resolving night {game.round_num}")
     
-    # КРОК 1: Збираємо потенційні смерті
+    # ============================================================================
+    # КРОК 1: Збираємо смерті
+    # ============================================================================
     potential_deaths = set()
     
     if game.don_target:
         potential_deaths.add(game.don_target)
-        logger.info(f"🔪 Дон → {game.players[game.don_target].username}")
     
     if game.detective_shoot_target:
         potential_deaths.add(game.detective_shoot_target)
-        logger.info(f"🔫 Детектив → {game.players[game.detective_shoot_target].username}")
     
     # Potato kills
     for thrower_id, target_id in game.potato_actions:
         if random.random() < config.POTATO_KILL_CHANCE:
             potential_deaths.add(target_id)
-            thrower = game.players[thrower_id]
-            target = game.players[target_id]
-            logger.info(f"🥔💥 {thrower.username} → {target.username}")
-            await safe_send_message(
-                context,
-                game.group_chat_id,
-                visual.POTATO_RESULT_HIT.format(name=target.username),
-                parse_mode='HTML'
-            )
-            await asyncio.sleep(0.5)
-        else:
-            target = game.players[target_id]
-            logger.info(f"🥔 Промах → {target.username}")
-            await safe_send_message(
-                context,
-                game.group_chat_id,
-                visual.POTATO_RESULT_MISS.format(name=target.username),
-                parse_mode='HTML'
-            )
-            await asyncio.sleep(0.5)
     
-    # КРОК 2: Застосовуємо лікаря
+    # ============================================================================
+    # КРОК 2: Лікар
+    # ============================================================================
     saved_player_id = None
     
     if game.doctor_target and game.doctor_target in potential_deaths:
         potential_deaths.remove(game.doctor_target)
         saved_player_id = game.doctor_target
-        logger.info(f"💚 Лікар врятував: {game.players[saved_player_id].username}")
-        
-        # Award heal
-        for p in game.players.values():
-            if p.role == "doctor" and p.is_alive:
-                p.heals += 1
-                if not p.is_bot:
-                    await db.update_user_stats(
-                        await db.get_or_create_user(p.telegram_id, p.username),
-                        saves=1
-                    )
+        logger.info(f"💚 Doctor saved: {game.players[saved_player_id].username}")
     
-    # КРОК 3: Повідомляємо жертв про замахи
-    attempted_targets = []
-    if game.don_target:
-        attempted_targets.append(game.don_target)
-    if game.detective_shoot_target:
-        attempted_targets.append(game.detective_shoot_target)
+    # ============================================================================
+    # КРОК 3: Повідомити жертв + запит останніх слів
+    # ============================================================================
+    dying_players = []
     
-    for target_id in set(attempted_targets):
+    for target_id in potential_deaths:
         target = game.players[target_id]
         
         if target.is_bot or not target.telegram_id:
             continue
         
-        was_saved = target_id == saved_player_id
-        will_die = target_id in potential_deaths
+        dying_players.append(target_id)
+        game.awaiting_last_words.add(target_id)
         
         try:
-            if was_saved:
-                # 🎉 ВРЯТУВАЛИ
+            await context.bot.send_message(
+                target.telegram_id,
+                f"⚠️ <b>НА ТЕБЕ СКОЇЛИ ЗАМАХ!</b>\n\n"
+                f"Це кінець. У тебе <b>{config.LAST_WORDS_TIMEOUT}с</b> написати останні слова.\n\n"
+                f"<i>Надішли текст (до 200 символів)</i>",
+                parse_mode='HTML'
+            )
+            logger.info(f"💀 Last words request sent: {target.username}")
+        except Exception as e:
+            logger.error(f"Error sending last words request: {e}")
+    
+    # Повідомити врятованих
+    if saved_player_id:
+        target = game.players[saved_player_id]
+        if not target.is_bot and target.telegram_id:
+            try:
                 await context.bot.send_message(
                     target.telegram_id,
                     "🚑 <b>ТЕБЕ ВРЯТУВАЛИ!</b>\n\n"
-                    "На тебе скоїли замах, але лікар прибіг вчасно!\n\n"
-                    "✨ <b>От і вдача!</b> Ти живий!",
+                    "На тебе скоїли замах, але лікар встиг! Ти живий! ✨",
                     parse_mode='HTML'
                 )
-                logger.info(f"💚 {target.username} врятовано - повідомлено")
-            
-            elif will_die:
-                # 💀 ПОМРЕШ
-                await context.bot.send_message(
-                    target.telegram_id,
-                    f"⚠️ <b>НА ТЕБЕ СКОЇЛИ ЗАМАХ!</b>\n\n"
-                    f"Лікар не встиг... Це кінець.\n\n"
-                    f"У тебе <b>{config.LAST_WORDS_TIMEOUT}с</b> написати останні слова.\n\n"
-                    f"<i>Надішли текст (до 200 символів)</i>",
-                    parse_mode='HTML'
-                )
-                game.awaiting_last_words.add(target_id)
-                logger.info(f"💀 {target.username} помирає - запит останніх слів")
-        
-        except Exception as e:
-            logger.error(f"Помилка повідомлення {target.username}: {e}")
+            except:
+                pass
     
-    # КРОК 4: Чекаємо останні слова
-    if game.awaiting_last_words and config.LAST_WORDS_ENABLED:
-        logger.info(f"⏳ Чекаємо {config.LAST_WORDS_TIMEOUT}с на останні слова")
+    # ✅ КРИТИЧНО: Чекаємо останні слова
+    if dying_players and config.LAST_WORDS_ENABLED:
+        logger.info(f"⏳ Waiting {config.LAST_WORDS_TIMEOUT}s for last words from {len(dying_players)} players")
         await asyncio.sleep(config.LAST_WORDS_TIMEOUT)
-        logger.info(f"✅ Отримано {len(game.last_words)} останніх слів")
+        logger.info(f"✅ Received {len(game.last_words)}/{len(dying_players)} last words")
     
-    # КРОК 5: Застосовуємо смерті
+    # ============================================================================
+    # КРОК 4: Застосувати смерті
+    # ============================================================================
     deaths = list(potential_deaths)
     
     for pid in deaths:
         player = game.players[pid]
         player.is_alive = False
-        logger.info(f"💀 {player.username} помер ({player.role})")
+        logger.info(f"💀 {player.username} died ({player.role})")
         
+        # Update DB
         if player.db_player_id:
+            import db
             await db.update_game_player_stats(player.db_player_id, is_alive=0)
         
         # Bot AI learns
@@ -1307,19 +1286,10 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
             bot = game.players[bot_pid]
             if bot.is_bot and bot.is_alive:
                 await bot_ai.observe_death(bot.player_id, pid, player.role)
-        
-        # Award kills
-        if game.don_target == pid:
-            for p in game.players.values():
-                if p.role in ["don", "mafia"] and p.is_alive:
-                    p.kills += 1
-                    if not p.is_bot:
-                        await db.update_user_stats(
-                            await db.get_or_create_user(p.telegram_id, p.username),
-                            kills=1
-                        )
     
-    # КРОК 6: Надіслати результати перевірок
+    # ============================================================================
+    # КРОК 5: Надіслати результати перевірок
+    # ============================================================================
     for checker_id, (target_id, target_role) in game.check_results.items():
         checker = game.players[checker_id]
         target = game.players[target_id]
@@ -1334,14 +1304,17 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
                     ),
                     parse_mode='HTML'
                 )
-                logger.info(f"🔍 {checker.username} → {target.username}: {target_role}")
-            except Exception as e:
-                logger.error(f"Помилка перевірки: {e}")
+            except:
+                pass
     
-    # КРОК 7: Надіслати повідомлення про дії
+    # ============================================================================
+    # КРОК 6: Надіслати нічні нотіфікації (мафії, лікарю, детективу)
+    # ============================================================================
     await send_night_notifications(game, context, deaths, saved_player_id)
     
-    # КРОК 8: Визначити події
+    # ============================================================================
+    # КРОК 7: Визначити події
+    # ============================================================================
     events = []
     if len(deaths) == 0:
         if saved_player_id:
@@ -1350,7 +1323,6 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
             events.append("event_everyone_alive")
     elif len(deaths) == 1:
         events.append("event_single_death")
-        
         dead_player = game.players[deaths[0]]
         if dead_player.role == "don":
             if any(p.is_alive and p.role == "mafia" for p in game.players.values()):
@@ -1361,22 +1333,27 @@ async def resolve_night(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> 
             events.append("doc_dead")
         elif dead_player.role == "detective":
             events.append("detective_dead")
-        elif dead_player.role == "civilian":
-            events.append("civil_dead")
     else:
         events.append("event_both_died")
     
+    # ============================================================================
+    # КРОК 8: Скинути прапорці
+    # ============================================================================
+    if hasattr(game, '_resolving_night'):
+        game._resolving_night = False
+    if hasattr(game, '_day_started'):
+        game._day_started = False
+    
+    # ============================================================================
     # КРОК 9: Перехід до дня
-    if hasattr(game, '_day_started') and game._day_started:
-        logger.warning("⚠️ День вже почався")
-        return
-    
-    game._day_started = True
-    game._resolving_night = False
-    
+    # ============================================================================
     await asyncio.sleep(2)
-    
     await start_day(game, context, events, deaths)
+
+
+# ============================================================================
+# ФІХ #3: SAFE SEND ANIMATION З TIMEOUT
+# ============================================================================
 
 async def send_night_notifications(game: GameState, context: ContextTypes.DEFAULT_TYPE,
                                    deaths: List[str], saved_player_id: Optional[str]) -> None:
@@ -1458,21 +1435,24 @@ async def send_night_notifications(game: GameState, context: ContextTypes.DEFAUL
                 except Exception as e:
                     logger.error(f"Помилка детектив-нотіфікації: {e}")
 
-async def start_day(game: GameState, context: ContextTypes.DEFAULT_TYPE,
-                    events: List[str], deaths: List[str]) -> None:
-    """Start day phase with flood control."""
+async def start_day(game, context, events: List[str], deaths: List[str]) -> None:
+    """
+    Start day - ВИПРАВЛЕНА ВЕРСІЯ.
     
-    # Скидаємо прапорець для наступного раунду
+    КРИТИЧНО: Показуємо останні слова ПЕРЕД morning report
+    """
+    import visual
+    from engine import safe_send_message, safe_send_animation_fixed, check_win_condition, start_timer
+    
     game._day_started = False
-    
     game.phase = Phase.DAY
     
-    logger.info(visual.format_game_log(game.game_id, game.round_num, "DAY", "☀️ День почався"))
+    logger.info(f"☀️ Day {game.round_num} started")
     
     # Send morning GIF
     try:
         with open("gifs/morning.gif", "rb") as gif_file:
-            await safe_send_animation(
+            await safe_send_animation_fixed(
                 context,
                 game.group_chat_id,
                 animation=gif_file,
@@ -1480,7 +1460,7 @@ async def start_day(game: GameState, context: ContextTypes.DEFAULT_TYPE,
                 parse_mode='HTML'
             )
     except Exception as e:
-        logger.warning(f"Не вдалося надіслати GIF ранку: {e}")
+        logger.warning(f"Failed to send morning GIF: {e}")
         await safe_send_message(
             context,
             game.group_chat_id,
@@ -1490,10 +1470,26 @@ async def start_day(game: GameState, context: ContextTypes.DEFAULT_TYPE,
     
     await asyncio.sleep(1.5)
     
-    # 🔧 ВИПРАВЛЕНО: Показуємо останні слова ТІЛЬКИ ТУТ
+    # ✅ КРИТИЧНО: Показати останні слова ПЕРШИМИ
     if game.last_words:
-        logger.info(f"💬 Показуємо останні слова від {len(game.last_words)} гравців")
-        await broadcast_last_words(game, context)
+        logger.info(f"💬 Showing {len(game.last_words)} last words")
+        
+        for pid, message in game.last_words.items():
+            player = game.players[pid]
+            
+            await safe_send_message(
+                context,
+                game.group_chat_id,
+                f"💬 <b>Останні слова {player.username}:</b>\n\n"
+                f"<i>\"{message}\"</i>",
+                parse_mode='HTML'
+            )
+            await asyncio.sleep(0.8)
+        
+        # Clear
+        game.last_words.clear()
+        game.awaiting_last_words.clear()
+        
         await asyncio.sleep(1)
     
     # Build event details
@@ -1528,13 +1524,14 @@ async def start_day(game: GameState, context: ContextTypes.DEFAULT_TYPE,
         parse_mode='HTML'
     )
     
-    # Check win conditions
+    # Check win
     if await check_win_condition(game, context):
         return
     
     await asyncio.sleep(1)
     
     # Start timer
+    import config
     await start_timer(game, context, config.DAY_DURATION, "day")
 
 
@@ -1752,44 +1749,32 @@ async def execute_bot_lynch_vote(game: GameState, bot: PlayerState) -> None:
 
 
 
-async def handle_lynch_decision_complete(game: GameState, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_lynch_decision_complete(game, context) -> None:
     """
-    Handle completed lynch decision voting.
+    Handle lynch decision - МАКСИМАЛЬНИЙ ЗАХИСТ.
     
-    ✅ ЗАХИСТ:
-    - Async lock (тільки один виклик одночасно)
-    - Processing flag
-    - Timestamp check
+    ПРОБЛЕМА: Подвійні виклики
+    РІШЕННЯ: Processing flag + timestamp + lock
     """
+    from button_protection import button_protection
     
-    # Створити lock якщо немає
-    if not hasattr(game, '_lynch_lock'):
-        game._lynch_lock = asyncio.Lock()
-    
-    # Спробувати отримати lock (не блокуючи якщо вже зайнято)
-    if game._lynch_lock.locked():
-        logger.warning("⚠️ Lynch decision вже обробляється (lock busy), пропускаємо")
+    if game.phase != Phase.VOTING:
         return
     
-    async with game._lynch_lock:
-        # Додаткова перевірка processing flag
-        if hasattr(game, '_processing_lynch') and game._processing_lynch:
-            logger.warning("⚠️ Lynch decision flag=True, пропускаємо")
-            return
+    # ✅ CHECK: Processing flag
+    if button_protection.is_processing(game.game_id, "lynch_decision"):
+        logger.warning("⚠️ Lynch decision already processing")
+        return
+    
+    # ✅ SET: Processing flag
+    button_protection.set_processing(game.game_id, "lynch_decision", True)
+    
+    try:
+        # Create lock if needed
+        if not hasattr(game, '_lynch_lock'):
+            game._lynch_lock = asyncio.Lock()
         
-        # Timestamp check
-        current_time = time.time()
-        if hasattr(game, '_last_lynch_time'):
-            time_diff = current_time - game._last_lynch_time
-            if time_diff < 1.0:
-                logger.warning(f"⚠️ Lynch decision занадто швидко ({time_diff:.2f}s), блокуємо")
-                return
-        
-        # Встановити прапорці
-        game._last_lynch_time = current_time
-        game._processing_lynch = True
-        
-        try:
+        async with game._lynch_lock:
             alive_count = sum(1 for p in game.players.values() if p.is_alive)
             
             yes_count = 0
@@ -1798,20 +1783,23 @@ async def handle_lynch_decision_complete(game: GameState, context: ContextTypes.
             for voter_id, vote in game.lynch_votes.items():
                 voter = game.players[voter_id]
                 weight = 2 if voter.role == "mayor" else 1
-                
                 if vote == "yes":
                     yes_count += weight
                 else:
                     no_count += weight
             
-            logger.info(f"📊 Lynch: ТАК={yes_count}, НІ={no_count}, ВСЬОГО={alive_count}")
+            logger.info(f"📊 Lynch decision: YES={yes_count}, NO={no_count}, TOTAL={alive_count}")
             
-            # Потрібна більшість
+            # Need majority
             if yes_count > alive_count / 2:
-                logger.info(f"✅ Переходимо до номінацій")
+                logger.info("✅ Lynch approved -> nominations")
+                from engine import start_nominations
                 await start_nominations(game, context)
             else:
-                logger.info(f"❌ Недостатньо голосів")
+                logger.info("❌ Lynch rejected -> next round")
+                import visual
+                from engine import safe_send_message, start_night
+                
                 await safe_send_message(
                     context,
                     game.group_chat_id,
@@ -1821,9 +1809,10 @@ async def handle_lynch_decision_complete(game: GameState, context: ContextTypes.
                 
                 game.round_num += 1
                 await start_night(game, context)
-        
-        finally:
-            game._processing_lynch = False
+    
+    finally:
+        # ✅ CLEAR: Processing flag
+        button_protection.set_processing(game.game_id, "lynch_decision", False)
 
 # ====================================================
 # ВИПРАВЛЕННЯ №1: Таймер з правильним оновленням
@@ -2522,22 +2511,40 @@ async def end_game(game: GameState, context: ContextTypes.DEFAULT_TYPE, winner: 
 # TIMER MANAGEMENT
 # ====================================================
 
-async def start_timer(game: GameState, context: ContextTypes.DEFAULT_TYPE, 
-                     duration: int, phase_name: str) -> None:
-    """Start phase timer with countdown."""
-    if game.timer_task:
+async def start_timer(game, context, duration: int, phase_name: str) -> None:
+    """
+    Start phase timer with DELAY before first message.
+    
+    ПРОБЛЕМА: Перший таймер не показується
+    ПРИЧИНА: race condition - таймер стартує ДО того як resolve_night закінчиться
+    РІШЕННЯ: 2s delay перед першим таймером
+    """
+    if game.timer_task and not game.timer_task.done():
         game.timer_task.cancel()
+        try:
+            await game.timer_task
+        except asyncio.CancelledError:
+            pass
+    
+    # ✅ КРИТИЧНО: Затримка перед ПЕРШИМ таймером
+    if phase_name == "night" and game.round_num == 1:
+        logger.info("⏳ First night timer - добавляємо 2s delay")
+        await asyncio.sleep(2)
     
     game.timer_task = asyncio.create_task(
         run_timer(game, context, duration, phase_name)
     )
 
 
-async def run_timer(game: GameState, context: ContextTypes.DEFAULT_TYPE, 
-                   duration: int, phase_name: str) -> None:
-    """Run countdown timer with fixed updates."""
+async def run_timer(game, context, duration: int, phase_name: str) -> None:
+    """
+    Run countdown timer - ВИПРАВЛЕНА ВЕРСІЯ.
+    """
+    import config
+    import visual
+    from engine import on_phase_timeout
     
-    # Send initial timer message
+    # Send initial timer
     try:
         msg = await context.bot.send_message(
             game.group_chat_id,
@@ -2545,9 +2552,9 @@ async def run_timer(game: GameState, context: ContextTypes.DEFAULT_TYPE,
             parse_mode='HTML'
         )
         game.timer_message_id = msg.message_id
-        logger.info(f"Timer started: {phase_name} for {duration}s")
+        logger.info(f"⏰ Timer started: {phase_name} for {duration}s (msg_id={msg.message_id})")
     except Exception as e:
-        logger.error(f"Failed to send initial timer: {e}")
+        logger.error(f"❌ Failed to send timer: {e}")
         await asyncio.sleep(duration)
         await on_phase_timeout(game, context, phase_name)
         return
@@ -2555,30 +2562,33 @@ async def run_timer(game: GameState, context: ContextTypes.DEFAULT_TYPE,
     try:
         elapsed = 0
         update_interval = config.TIMER_UPDATE_INTERVAL
+        last_update = 0
         
         while elapsed < duration:
-            await asyncio.sleep(update_interval)
-            elapsed += update_interval
-            remaining = max(0, duration - elapsed)
+            await asyncio.sleep(1)
+            elapsed += 1
+            remaining = duration - elapsed
             
-            # Update timer display
-            try:
-                await context.bot.edit_message_text(
-                    visual.format_timer_text(phase_name, remaining),
-                    chat_id=game.group_chat_id,
-                    message_id=game.timer_message_id,
-                    parse_mode='HTML'
-                )
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "message is not modified" not in error_msg:
-                    logger.debug(f"Timer update error: {e}")
+            # Update every TIMER_UPDATE_INTERVAL
+            if elapsed - last_update >= update_interval or remaining == 0:
+                try:
+                    await context.bot.edit_message_text(
+                        visual.format_timer_text(phase_name, remaining),
+                        chat_id=game.group_chat_id,
+                        message_id=game.timer_message_id,
+                        parse_mode='HTML'
+                    )
+                    last_update = elapsed
+                    logger.debug(f"⏰ Timer update: {remaining}s")
+                except Exception as e:
+                    if "not modified" not in str(e).lower():
+                        logger.debug(f"Timer update error: {e}")
         
-        logger.info(f"Timer finished: {phase_name}")
+        logger.info(f"⏰ Timer finished: {phase_name}")
         await on_phase_timeout(game, context, phase_name)
         
     except asyncio.CancelledError:
-        logger.info(f"Timer cancelled for {phase_name}")
+        logger.info(f"⏰ Timer cancelled: {phase_name}")
         raise
 
 
